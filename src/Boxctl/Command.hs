@@ -10,6 +10,8 @@ import Boxctl.CLI
 import Boxctl.Instance (resolveInstance)
 import Boxctl.Output
 import Control.Concurrent.Async (mapConcurrently)
+import Data.Aeson (Value, encode, object, toJSON, (.=))
+import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Either (partitionEithers)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
@@ -30,10 +32,10 @@ run options = do
       pure (Left err)
     Right resolvedInstance -> do
       controller <- mkController resolvedInstance (optVerbose options)
-      runCommand controller (optCommand options)
+      runCommand (optOutputMode options) controller (optCommand options)
 
-runCommand :: Controller -> Command -> IO (Either Text ())
-runCommand controller command =
+runCommand :: OutputMode -> Controller -> Command -> IO (Either Text ())
+runCommand outputMode controller command =
   case command of
     CmdVersion -> do
       versionResult <- fetchVersion controller
@@ -41,7 +43,11 @@ runCommand controller command =
         Left err ->
           pure (Left err)
         Right versionInfo -> do
-          emit (renderVersion (T.pack (showVersion version)) versionInfo)
+          let localVersion = T.pack (showVersion version)
+          emitOutput
+            outputMode
+            (renderVersion localVersion versionInfo)
+            (object ["boxctlVersion" .= localVersion, "server" .= versionInfo])
           pure (Right ())
     CmdMode -> do
       configResult <- fetchConfigs controller
@@ -49,7 +55,7 @@ runCommand controller command =
         Left err ->
           pure (Left err)
         Right config -> do
-          emit (renderMode config)
+          emitOutput outputMode (renderMode config) (toJSON config)
           pure (Right ())
     CmdSwitch newMode -> do
       supportedModesResult <- fetchConfigs controller
@@ -69,41 +75,64 @@ runCommand controller command =
                     Left err ->
                       pure (Left err)
                     Right config -> do
-                      emit (renderSwitch config)
+                      emitOutput outputMode (renderSwitch config) (toJSON config)
                       pure (Right ())
-    CmdList -> do
+    CmdList listOptions -> do
       proxyResult <- fetchProxies controller
       case proxyResult of
         Left err ->
           pure (Left err)
         Right proxies -> do
-          emit (renderList proxies)
+          emitOutput
+            outputMode
+            (renderList listOptions proxies)
+            (object ["proxies" .= proxies])
           pure (Right ())
     CmdShow selection -> do
-      proxyResult <- selectProxies controller selection
-      case proxyResult of
+      allProxyResult <- fetchProxies controller
+      case allProxyResult of
         Left err ->
           pure (Left err)
-        Right proxies -> do
-          emit (renderProxyDetails proxies)
-          pure (Right ())
+        Right allProxies ->
+          case selectProxiesFrom selection allProxies of
+            Left err ->
+              pure (Left err)
+            Right proxies -> do
+              emitOutput
+                outputMode
+                (renderProxyDetails (proxyIndex allProxies) proxies)
+                (object ["proxies" .= proxies])
+              pure (Right ())
     CmdTest selection -> do
-      proxyResult <- selectProxies controller selection
-      case proxyResult of
+      allProxyResult <- fetchProxies controller
+      case allProxyResult of
         Left err ->
           pure (Left err)
-        Right proxies -> do
-          tested <- mapConcurrently (testProxy controller) proxies
-          let (errs, results) = partitionEithers tested
-          mapM_ (TIO.hPutStrLn stderr) errs
-          if null results
-            then pure (Left "no delay results were produced")
-            else do
-              emit (renderTestResults results)
-              pure $
-                if null errs
-                  then Right ()
-                  else Left "one or more delay tests failed"
+        Right allProxies ->
+          case selectProxiesFrom selection allProxies of
+            Left err ->
+              pure (Left err)
+            Right proxies -> do
+              tested <- mapConcurrently (testProxy controller) proxies
+              let (errs, results) = partitionEithers tested
+                  payload = object ["results" .= results, "errors" .= errs]
+              case outputMode of
+                OutputHuman ->
+                  mapM_ (TIO.hPutStrLn stderr) errs
+                OutputJson ->
+                  pure ()
+              if null results
+                then do
+                  case outputMode of
+                    OutputJson -> emitJson payload
+                    OutputHuman -> pure ()
+                  pure (Left "no delay results were produced")
+                else do
+                  emitOutput outputMode (renderTestResults results) payload
+                  pure $
+                    if null errs
+                      then Right ()
+                      else Left "one or more delay tests failed"
     CmdSelect args -> do
       selectorResult <- resolveSelector controller args
       case selectorResult of
@@ -115,28 +144,39 @@ runCommand controller command =
             Left err ->
               pure (Left err)
             Right () -> do
-              emit (renderSelect (proxyName selectorProxy) selectorOption)
+              emitOutput
+                outputMode
+                (renderSelect (proxyName selectorProxy) selectorOption)
+                ( object
+                    [ "selector" .= proxyName selectorProxy,
+                      "selected" .= selectorOption
+                    ]
+                )
               pure (Right ())
 
-selectProxies :: Controller -> ProxySelection -> IO (Either Text [ProxyInfo])
-selectProxies controller selection = do
-  allProxyResult <- fetchProxies controller
-  pure $ do
-    allProxies <- allProxyResult
-    let proxyMap = Map.fromList [(proxyName proxy, proxy) | proxy <- allProxies]
-        requestedNames = selectionNames selection
-        selectedByName =
-          if null requestedNames
-            then Right (sortOn (T.toCaseFold . proxyName) allProxies)
-            else traverse (lookupProxy proxyMap) requestedNames
-    proxies <- selectedByName
-    filtered <- traverse ensureMatch proxies
-    if null filtered
-      then Left "no matching outbounds"
-      else Right filtered
+selectProxiesFrom :: ProxySelection -> [ProxyInfo] -> Either Text [ProxyInfo]
+selectProxiesFrom selection allProxies =
+  if null requestedNames
+    then
+      if null filteredAll
+        then Left "no matching outbounds"
+        else Right filteredAll
+    else do
+      proxies <- traverse (lookupProxy proxyMap) requestedNames
+      filtered <- traverse ensureMatch proxies
+      if null filtered
+        then Left "no matching outbounds"
+        else Right filtered
   where
-    lookupProxy proxyMap proxyName =
-      maybe (Left ("outbound not found: " <> proxyName)) Right (Map.lookup proxyName proxyMap)
+    proxyMap = proxyIndex allProxies
+    requestedNames = selectionNames selection
+    filteredAll =
+      filter
+        (filterMatches (selectionFilter selection))
+        (sortOn (T.toCaseFold . proxyName) allProxies)
+
+    lookupProxy proxiesByName proxyName =
+      maybe (Left ("outbound not found: " <> proxyName)) Right (Map.lookup proxyName proxiesByName)
 
     ensureMatch proxy
       | filterMatches (selectionFilter selection) proxy = Right proxy
@@ -221,6 +261,10 @@ materializeGroupError proxy label =
   where
     orderedMembers = fromMaybe [] (proxyAll proxy)
 
+proxyIndex :: [ProxyInfo] -> Map Text ProxyInfo
+proxyIndex proxies =
+  Map.fromList [(proxyName proxy, proxy) | proxy <- proxies]
+
 findProxy :: [ProxyInfo] -> Text -> Maybe ProxyInfo
 findProxy proxies targetName =
   case filter (\proxy -> proxyName proxy == targetName) proxies of
@@ -258,6 +302,15 @@ delayFailureLabel :: Text -> Text
 delayFailureLabel err
   | "Timeout" `T.isInfixOf` err || "HTTP 504" `T.isPrefixOf` err = "timeout"
   | otherwise = "unavailable"
+
+emitOutput :: OutputMode -> Text -> Value -> IO ()
+emitOutput outputMode humanOutput jsonOutput =
+  case outputMode of
+    OutputHuman -> emit humanOutput
+    OutputJson -> emitJson jsonOutput
+
+emitJson :: Value -> IO ()
+emitJson = BL8.putStrLn . encode
 
 emit :: Text -> IO ()
 emit = TIO.putStrLn . T.dropWhileEnd (== '\n')

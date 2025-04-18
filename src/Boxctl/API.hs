@@ -101,17 +101,39 @@ instance FromJSON VersionResponse where
       <*> obj .:? "premium" .!= False
       <*> obj .:? "meta" .!= False
 
+instance ToJSON VersionResponse where
+  toJSON versionInfo =
+    object
+      [ "version" .= versionText versionInfo,
+        "premium" .= versionPremium versionInfo,
+        "meta" .= versionMeta versionInfo
+      ]
+
 instance FromJSON ConfigResponse where
   parseJSON = withObject "ConfigResponse" $ \obj ->
     ConfigResponse
       <$> obj .: "mode"
       <*> obj .:? "mode-list" .!= []
 
+instance ToJSON ConfigResponse where
+  toJSON config =
+    object
+      [ "mode" .= configMode config,
+        "mode-list" .= configModeList config
+      ]
+
 instance FromJSON DelayHistory where
   parseJSON = withObject "DelayHistory" $ \obj ->
     DelayHistory
       <$> obj .: "time"
       <*> obj .: "delay"
+
+instance ToJSON DelayHistory where
+  toJSON delayHistory =
+    object
+      [ "time" .= historyTime delayHistory,
+        "delay" .= historyDelay delayHistory
+      ]
 
 instance FromJSON ProxyInfo where
   parseJSON = withObject "ProxyInfo" $ \obj ->
@@ -123,9 +145,26 @@ instance FromJSON ProxyInfo where
       <*> obj .:? "now"
       <*> obj .:? "all"
 
+instance ToJSON ProxyInfo where
+  toJSON proxy =
+    object
+      [ "type" .= proxyType proxy,
+        "name" .= proxyName proxy,
+        "udp" .= proxyUdp proxy,
+        "history" .= proxyHistory proxy,
+        "now" .= proxyNow proxy,
+        "all" .= proxyAll proxy
+      ]
+
 instance FromJSON DelayResponse where
   parseJSON = withObject "DelayResponse" $ \obj ->
     DelayResponse <$> obj .: "delay"
+
+instance ToJSON DelayResponse where
+  toJSON delayResponse =
+    object
+      [ "delay" .= delayValue delayResponse
+      ]
 
 instance FromJSON ProxyEnvelope where
   parseJSON = withObject "ProxyEnvelope" $ \obj ->

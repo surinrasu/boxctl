@@ -3,7 +3,9 @@
 
 module Boxctl.CLI
   ( Command (..),
+    ListOptions (..),
     Options (..),
+    OutputMode (..),
     ProxyFilter (..),
     ProxySelection (..),
     parseOptions,
@@ -19,18 +21,29 @@ import qualified System.IO as IO
 data Options = Options
   { optInstance :: Maybe FilePath,
     optVerbose :: Bool,
+    optOutputMode :: OutputMode,
     optCommand :: Command
   }
+  deriving (Eq, Show)
+
+data OutputMode
+  = OutputHuman
+  | OutputJson
   deriving (Eq, Show)
 
 data Command
   = CmdVersion
   | CmdMode
   | CmdSwitch Text
-  | CmdList
+  | CmdList ListOptions
   | CmdShow ProxySelection
   | CmdTest ProxySelection
   | CmdSelect [Text]
+  deriving (Eq, Show)
+
+data ListOptions = ListOptions
+  { listIncludeNodes :: Bool
+  }
   deriving (Eq, Show)
 
 data ProxySelection = ProxySelection
@@ -72,6 +85,10 @@ optionsParser =
           <> short 'v'
           <> help "Verbose output"
       )
+    <*> flag OutputHuman OutputJson
+      ( long "json"
+          <> help "Emit JSON output"
+      )
     <*> commandParser
 
 instanceOption :: Parser String
@@ -89,7 +106,7 @@ commandParser =
     command "version" (info (pure CmdVersion) (progDesc "Show version"))
       <> command "mode" (info (pure CmdMode) (progDesc "Show current Clash mode"))
       <> command "switch" (info switchParser (progDesc "Switch Clash mode"))
-      <> command "list" (info (pure CmdList) (progDesc "List all outbounds"))
+      <> command "list" (info listParser (progDesc "List configured outbounds"))
       <> command "show" (info showParser (progDesc "Show details of outbounds"))
       <> command "test" (info testParser (progDesc "Test delays of outbounds"))
       <> command "select" (info selectParser (progDesc "Select an option for a selector"))
@@ -101,6 +118,17 @@ switchParser =
       ( metavar "CLASH_MODE"
           <> help "Target Clash mode"
       )
+
+listParser :: Parser Command
+listParser =
+  CmdList
+    <$> ( ListOptions
+            <$> switch
+              ( long "all"
+                  <> short 'a'
+                  <> help "Include node outbounds in human output"
+              )
+        )
 
 showParser :: Parser Command
 showParser = CmdShow <$> proxySelectionParser
