@@ -1,0 +1,12 @@
+.DS_Store
+mise.local.toml
+AGENTS.local.md
+dist-newstyle/
+.cabal/
+.xdg/
+.ghc.environment.*
+.hie/
+.cabal-sandbox/
+*.hi
+*.o
+*.eventlog

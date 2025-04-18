@@ -1,0 +1,18 @@
+{
+  "lsp": {
+    "hls": {
+      "initialization_options": {
+        "haskell": {
+          "cabalFormattingProvider": "cabal-gild",
+          "plugin": {
+            "cabal-gild": {
+              "config": {
+                "path": "./.cabal/bin/cabal-gild"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

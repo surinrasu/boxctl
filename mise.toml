@@ -1,0 +1,16 @@
+[env]
+CABAL_DIR = "{{config_root}}/.cabal"
+XDG_CONFIG_HOME = "{{config_root}}/.xdg/config"
+XDG_CACHE_HOME = "{{config_root}}/.xdg/cache"
+XDG_STATE_HOME = "{{config_root}}/.xdg/state"
+XDG_DATA_HOME = "{{config_root}}/.xdg/data"
+_.path = ["{{config_root}}/.cabal/bin"]
+
+[plugins]
+ghc = "https://github.com/mise-plugins/mise-ghcup"
+hls = "https://github.com/mise-plugins/mise-ghcup"
+
+[tools]
+ghc = "latest"
+hls = "latest"
+cabal = { version = "latest", postinstall = "cabal install cabal-gild --installdir={{config_root}}/.cabal/bin --overwrite-policy=always" }

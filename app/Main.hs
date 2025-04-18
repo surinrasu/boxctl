@@ -1,0 +1,20 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+module Main (main) where
+
+import qualified Boxctl.CLI as CLI
+import qualified Boxctl.Command as Command
+import qualified Data.Text.IO as TIO
+import System.Exit (exitFailure)
+import System.IO (stderr)
+
+main :: IO ()
+main = do
+  options <- CLI.parseOptions
+  result <- Command.run options
+  case result of
+    Left err -> do
+      TIO.hPutStrLn stderr ("boxctl: " <> err)
+      exitFailure
+    Right () ->
+      pure ()

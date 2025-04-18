@@ -1,0 +1,65 @@
+cabal-version:      3.8
+name:               boxctl
+version:            0.1.0.0
+synopsis:           CLI controller for sing-box
+description:        A command-line tool works like Clash Dashboards, controlling sing-box instance via Clash RESTful API.
+license:            LGPL-3.0-or-later
+license-file:       LICENSE
+category:           CLI
+author:             Rinsu Su
+maintainer:         srs@surindaku.dev
+build-type:         Simple
+extra-doc-files:    README.md
+
+source-repository head
+  type: git
+  location: https://github.com/surinrasu/boxctl
+
+common common-settings
+  default-language: GHC2021
+  ghc-options:
+    -Wall
+    -Wcompat
+    -Widentities
+    -Wincomplete-record-updates
+    -Wincomplete-uni-patterns
+    -Wmissing-export-lists
+    -Wmissing-home-modules
+    -Wpartial-fields
+    -Wredundant-constraints
+  build-depends:
+      aeson >=2.2 && <2.3
+    , async >=2.2 && <2.3
+    , base >=4.19 && <5
+    , bytestring >=0.11 && <0.13
+    , containers >=0.6 && <0.9
+    , directory >=1.3 && <1.4
+    , filepath >=1.4 && <1.6
+    , http-client >=0.7 && <0.8
+    , http-client-tls >=0.3 && <0.4
+    , http-types >=0.12 && <0.13
+    , optparse-applicative >=0.18 && <0.19
+    , text >=2.0 && <2.2
+    , time >=1.12 && <1.16
+    , transformers >=0.6 && <0.7
+
+library
+  import: common-settings
+  hs-source-dirs: src
+  autogen-modules:
+      Paths_boxctl
+  other-modules:
+      Paths_boxctl
+  exposed-modules:
+      Boxctl.API
+    , Boxctl.CLI
+    , Boxctl.Command
+    , Boxctl.Instance
+    , Boxctl.Output
+
+executable boxctl
+  import: common-settings
+  hs-source-dirs: app
+  main-is: Main.hs
+  build-depends:
+      boxctl
