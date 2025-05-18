@@ -6,7 +6,7 @@ boxctl [OPTION] <COMMAND>
 ```
 
 - **options**:
-  - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance
+  - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance, defaults to `127.0.0.1:9090`
   - `--verbose`                             Verbose output
   - `--json`                                Emit JSON output
   - `--help`                                Show this help text

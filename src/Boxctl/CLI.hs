@@ -97,7 +97,7 @@ instanceOption =
     ( long "instance"
         <> short 'i'
         <> metavar "<<PATH>|<ADDR[:<PORT>]>>"
-        <> help "Target instance"
+        <> help "Target instance (defaults to 127.0.0.1:9090)"
     )
 
 commandParser :: Parser Command

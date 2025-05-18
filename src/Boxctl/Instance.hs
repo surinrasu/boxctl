@@ -19,6 +19,9 @@ import qualified Data.Text as T
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.Environment (lookupEnv)
 
+defaultControllerAddress :: Text
+defaultControllerAddress = "127.0.0.1:9090"
+
 data ConfigFile = ConfigFile
   { configExperimental :: Maybe ExperimentalBlock
   }
@@ -50,21 +53,20 @@ resolveInstance :: Maybe FilePath -> IO (Either Text ResolvedInstance)
 resolveInstance cliInstance = do
   envInstance <- lookupEnv "BOX_INSTANCE"
   envSecret <- fmap T.pack <$> lookupEnv "BOX_SECRET"
-  let rawInstance = cliInstance <|> envInstance
-  case rawInstance of
+  let instanceInput = cliInstance <|> envInstance <|> Just (T.unpack defaultControllerAddress)
+  case instanceInput of
     Nothing ->
-      pure $
-        Left "missing target instance; set --instance or BOX_INSTANCE"
-    Just instanceInput -> do
-      directoryExists <- doesDirectoryExist instanceInput
+      pure (Left "failed to resolve target instance")
+    Just target -> do
+      directoryExists <- doesDirectoryExist target
       if directoryExists
         then pure (Left "instance path must be a config file, not a directory")
         else do
-          fileExists <- doesFileExist instanceInput
+          fileExists <- doesFileExist target
           targetResult <-
             if fileExists
-              then resolveFromConfig instanceInput
-              else pure (resolveFromAddress (T.pack instanceInput))
+              then resolveFromConfig target
+              else pure (resolveFromAddress (T.pack target))
           pure $
             fmap
               (\resolved -> resolved {resolvedSecret = envSecret <|> resolvedSecret resolved})
