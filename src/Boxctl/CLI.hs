@@ -2,7 +2,8 @@
 {-# LANGUAGE OverloadedStrings #-}
 
 module Boxctl.CLI
-  ( Command (..),
+  ( ColorMode (..),
+    Command (..),
     ListOptions (..),
     Options (..),
     OutputMode (..),
@@ -22,6 +23,7 @@ data Options = Options
   { optInstance :: Maybe FilePath,
     optVerbose :: Bool,
     optOutputMode :: OutputMode,
+    optColorMode :: ColorMode,
     optCommand :: Command
   }
   deriving (Eq, Show)
@@ -29,6 +31,12 @@ data Options = Options
 data OutputMode
   = OutputHuman
   | OutputJson
+  deriving (Eq, Show)
+
+data ColorMode
+  = ColorAuto
+  | ColorAlways
+  | ColorNever
   deriving (Eq, Show)
 
 data Command
@@ -88,6 +96,13 @@ optionsParser =
     <*> flag OutputHuman OutputJson
       ( long "json"
           <> help "Emit JSON output"
+      )
+    <*> option colorModeReader
+      ( long "color"
+          <> metavar "auto|always|never"
+          <> value ColorAuto
+          <> showDefaultWith (const "auto")
+          <> help "Colorize human output"
       )
     <*> commandParser
 
@@ -204,3 +219,12 @@ validateSelection selection =
       Left "options --selectors and --url-tests are mutually exclusive"
     _ ->
       Right selection
+
+colorModeReader :: ReadM ColorMode
+colorModeReader =
+  eitherReader $ \rawValue ->
+    case T.toCaseFold (T.pack rawValue) of
+      "auto" -> Right ColorAuto
+      "always" -> Right ColorAlways
+      "never" -> Right ColorNever
+      _ -> Left "expected one of: auto, always, never"

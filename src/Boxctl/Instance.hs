@@ -51,8 +51,8 @@ instance Aeson.FromJSON ClashAPIBlock where
 
 resolveInstance :: Maybe FilePath -> IO (Either Text ResolvedInstance)
 resolveInstance cliInstance = do
-  envInstance <- lookupEnv "BOX_INSTANCE"
-  envSecret <- fmap T.pack <$> lookupEnv "BOX_SECRET"
+  envInstance <- lookupEnv "BOXCTL_INSTANCE"
+  envSecret <- fmap T.pack <$> lookupEnv "BOXCTL_SECRET"
   let instanceInput = cliInstance <|> envInstance <|> Just (T.unpack defaultControllerAddress)
   case instanceInput of
     Nothing ->

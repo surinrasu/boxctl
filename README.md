@@ -9,6 +9,7 @@ boxctl [OPTION] <COMMAND>
   - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance, defaults to `127.0.0.1:9090`
   - `--verbose`                             Verbose output
   - `--json`                                Emit JSON output
+  - `--color <auto|always|never>`           Colorise human output, defaults to `auto`
   - `--help`                                Show this help text
 
 - **commands**:
@@ -19,3 +20,8 @@ boxctl [OPTION] <COMMAND>
   - `show [OUTBOUND1] [OUTBOUND2] [...]`    Show details of outbounds
   - `test [OUTBOUND1] [OUTBOUND2] [...]`    Test delays of outbounds
   - `select [SELECTOR] <OPTION>`            Select an option for a selector
+
+- **environment**:
+  - `BOXCTL_INSTANCE`                       Default target
+  - `BOXCTL_SECRET`                         Default secret
+  - `BOXCTL_BACKGROUND=<dark|light>`        Override auto background detection
