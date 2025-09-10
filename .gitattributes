@@ -1,0 +1,2 @@
+.zed -linguist-detectable
+.nvim.lua -linguist-detectable
