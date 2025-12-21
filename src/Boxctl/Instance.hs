@@ -13,11 +13,14 @@ import Data.Aeson ((.:?))
 import qualified Data.Aeson as Aeson
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
-import Data.Char (isDigit)
+import Data.Char (isDigit, toLower)
+import Data.List (isInfixOf)
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.Environment (lookupEnv)
+import System.FilePath (hasDrive, isPathSeparator, takeExtension)
 
 defaultControllerAddress :: Text
 defaultControllerAddress = "127.0.0.1:9090"
@@ -53,24 +56,32 @@ resolveInstance :: Maybe FilePath -> IO (Either Text ResolvedInstance)
 resolveInstance cliInstance = do
   envInstance <- lookupEnv "BOXCTL_INSTANCE"
   envSecret <- fmap T.pack <$> lookupEnv "BOXCTL_SECRET"
-  let instanceInput = cliInstance <|> envInstance <|> Just (T.unpack defaultControllerAddress)
-  case instanceInput of
-    Nothing ->
-      pure (Left "failed to resolve target instance")
-    Just target -> do
-      directoryExists <- doesDirectoryExist target
-      if directoryExists
-        then pure (Left "instance path must be a config file, not a directory")
-        else do
-          fileExists <- doesFileExist target
-          targetResult <-
-            if fileExists
-              then resolveFromConfig target
-              else pure (resolveFromAddress (T.pack target))
-          pure $
-            fmap
-              (\resolved -> resolved {resolvedSecret = envSecret <|> resolvedSecret resolved})
-              targetResult
+  let target = fromMaybe (T.unpack defaultControllerAddress) (cliInstance <|> envInstance)
+  directoryExists <- doesDirectoryExist target
+  if directoryExists
+    then pure (Left "instance path must be a config file, not a directory")
+    else do
+      fileExists <- doesFileExist target
+      targetResult <-
+        if fileExists
+          then resolveFromConfig target
+          else
+            pure $
+              if looksLikeConfigPath target
+                then Left ("instance config file not found: " <> T.pack target)
+                else resolveFromAddress (T.pack target)
+      pure $
+        fmap
+          (\resolved -> resolved {resolvedSecret = envSecret <|> resolvedSecret resolved})
+          targetResult
+
+looksLikeConfigPath :: FilePath -> Bool
+looksLikeConfigPath target =
+  not ("://" `isInfixOf` target)
+    && ( hasDrive target
+           || any isPathSeparator target
+           || map toLower (takeExtension target) `elem` [".json", ".jsonc"]
+       )
 
 resolveFromConfig :: FilePath -> IO (Either Text ResolvedInstance)
 resolveFromConfig configPath = do

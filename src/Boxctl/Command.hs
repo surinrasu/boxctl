@@ -12,7 +12,7 @@ import Boxctl.Output
 import Control.Applicative ((<|>))
 import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (bracket)
-import Control.Monad (unless)
+import Control.Monad (unless, when)
 import Data.Aeson (Value, encode, object, toJSON, (.=))
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy.Char8 as BL8
@@ -47,15 +47,49 @@ import System.Posix.Terminal
 import System.Posix.Types (Fd)
 
 run :: Options -> IO (Either Text ())
-run options = do
+run options =
+  case optCommand options of
+    CmdVersion ->
+      runVersionCommand options
+    _ -> do
+      resolvedInstanceResult <- resolveInstance (optInstance options)
+      case resolvedInstanceResult of
+        Left err ->
+          pure (Left err)
+        Right resolvedInstance -> do
+          controller <- mkController resolvedInstance (optVerbose options)
+          renderStyle <- resolveRenderStyle options
+          runCommand renderStyle (optOutputMode options) controller (optCommand options)
+
+runVersionCommand :: Options -> IO (Either Text ())
+runVersionCommand options = do
+  let localVersion = T.pack (showVersion version)
+  serverVersionResult <- fetchServerVersionFor options
+  case serverVersionResult of
+    Right versionInfo -> do
+      emitOutput
+        (optOutputMode options)
+        (renderVersion localVersion (Just versionInfo))
+        (object ["boxctlVersion" .= localVersion, "server" .= versionInfo])
+      pure (Right ())
+    Left err -> do
+      when (optVerbose options) $
+        TIO.hPutStrLn stderr ("boxctl: server version unavailable: " <> err)
+      emitOutput
+        (optOutputMode options)
+        (renderVersion localVersion Nothing)
+        (object ["boxctlVersion" .= localVersion])
+      pure (Right ())
+
+fetchServerVersionFor :: Options -> IO (Either Text VersionResponse)
+fetchServerVersionFor options = do
   resolvedInstanceResult <- resolveInstance (optInstance options)
   case resolvedInstanceResult of
     Left err ->
       pure (Left err)
     Right resolvedInstance -> do
       controller <- mkController resolvedInstance (optVerbose options)
-      renderStyle <- resolveRenderStyle options
-      runCommand renderStyle (optOutputMode options) controller (optCommand options)
+      fetchVersion controller
 
 runCommand :: RenderStyle -> OutputMode -> Controller -> Command -> IO (Either Text ())
 runCommand renderStyle outputMode controller command =
@@ -69,7 +103,7 @@ runCommand renderStyle outputMode controller command =
           let localVersion = T.pack (showVersion version)
           emitOutput
             outputMode
-            (renderVersion localVersion versionInfo)
+            (renderVersion localVersion (Just versionInfo))
             (object ["boxctlVersion" .= localVersion, "server" .= versionInfo])
           pure (Right ())
     CmdMode -> do
@@ -185,21 +219,17 @@ selectProxiesFrom selection allProxies =
         then Left "no matching outbounds"
         else Right filteredAll
     else do
-      proxies <- traverse (lookupProxy proxyMap) requestedNames
+      proxies <- traverse (resolveProxyByName allProxies) requestedNames
       filtered <- traverse ensureMatch proxies
       if null filtered
         then Left "no matching outbounds"
         else Right filtered
   where
-    proxyMap = proxyIndex allProxies
     requestedNames = selectionNames selection
     filteredAll =
       filter
         (filterMatches (selectionFilter selection))
         (sortOn (T.toCaseFold . proxyName) allProxies)
-
-    lookupProxy proxiesByName proxyName =
-      maybe (Left ("outbound not found: " <> proxyName)) Right (Map.lookup proxyName proxiesByName)
 
     ensureMatch proxy
       | filterMatches (selectionFilter selection) proxy = Right proxy
@@ -219,10 +249,7 @@ resolveSelector controller args = do
     selectorProxy <-
       case selectorName of
         Just requestedName ->
-          maybe
-            (Left ("selector not found: " <> requestedName))
-            Right
-            (findProxy selectors requestedName)
+          resolveSelectorByName selectors requestedName
         Nothing ->
           case selectors of
             [onlySelector] -> Right onlySelector
@@ -232,16 +259,8 @@ resolveSelector controller args = do
                 ( "multiple selectors available, specify one of: "
                     <> T.intercalate ", " (map proxyName manySelectors)
                 )
-    let members = fromMaybe [] (proxyAll selectorProxy)
-    if optionName `elem` members
-      then Right (selectorProxy, optionName)
-      else
-        Left
-          ( "option not found in selector "
-              <> proxyName selectorProxy
-              <> ": "
-              <> optionName
-          )
+    selectedOption <- resolveSelectorOption selectorProxy optionName
+    Right (selectorProxy, selectedOption)
 
 testProxy :: Controller -> ProxyInfo -> IO (Either Text TestResult)
 testProxy controller proxy
@@ -288,11 +307,82 @@ proxyIndex :: [ProxyInfo] -> Map Text ProxyInfo
 proxyIndex proxies =
   Map.fromList [(proxyName proxy, proxy) | proxy <- proxies]
 
-findProxy :: [ProxyInfo] -> Text -> Maybe ProxyInfo
-findProxy proxies targetName =
-  case filter (\proxy -> proxyName proxy == targetName) proxies of
-    [] -> Nothing
-    proxy : _ -> Just proxy
+data NameMatch a
+  = MissingName
+  | UniqueName a
+  | AmbiguousName [a]
+
+findByName :: (a -> Text) -> [a] -> Text -> NameMatch a
+findByName getName values requestedName =
+  case filter (\value -> getName value == requestedName) values of
+    value : _ ->
+      UniqueName value
+    [] ->
+      case filter (\value -> textEqualsFold (getName value) requestedName) values of
+        [] -> MissingName
+        [value] -> UniqueName value
+        matches -> AmbiguousName matches
+
+resolveProxyByName :: [ProxyInfo] -> Text -> Either Text ProxyInfo
+resolveProxyByName proxies requestedName =
+  case findByName proxyName proxies requestedName of
+    MissingName ->
+      Left ("outbound not found: " <> requestedName)
+    UniqueName proxy ->
+      Right proxy
+    AmbiguousName matches ->
+      Left
+        ( "ambiguous outbound: "
+            <> requestedName
+            <> " (matches: "
+            <> renderMatchNames proxyName matches
+            <> ")"
+        )
+
+resolveSelectorByName :: [ProxyInfo] -> Text -> Either Text ProxyInfo
+resolveSelectorByName selectors requestedName =
+  case findByName proxyName selectors requestedName of
+    MissingName ->
+      Left ("selector not found: " <> requestedName)
+    UniqueName selectorProxy ->
+      Right selectorProxy
+    AmbiguousName matches ->
+      Left
+        ( "ambiguous selector: "
+            <> requestedName
+            <> " (matches: "
+            <> renderMatchNames proxyName matches
+            <> ")"
+        )
+
+resolveSelectorOption :: ProxyInfo -> Text -> Either Text Text
+resolveSelectorOption selectorProxy requestedOption =
+  case findByName id members requestedOption of
+    MissingName ->
+      Left
+        ( "option not found in selector "
+            <> proxyName selectorProxy
+            <> ": "
+            <> requestedOption
+        )
+    UniqueName selectedOption ->
+      Right selectedOption
+    AmbiguousName matches ->
+      Left
+        ( "ambiguous option in selector "
+            <> proxyName selectorProxy
+            <> ": "
+            <> requestedOption
+            <> " (matches: "
+            <> renderMatchNames id matches
+            <> ")"
+        )
+  where
+    members = fromMaybe [] (proxyAll selectorProxy)
+
+renderMatchNames :: (a -> Text) -> [a] -> Text
+renderMatchNames getName =
+  T.intercalate ", " . map getName
 
 isSelector :: ProxyInfo -> Bool
 isSelector = typeEquals "Selector"
@@ -314,7 +404,10 @@ filterMatches FilterConflict _ = False
 
 matchesAny :: [Text] -> Text -> Bool
 matchesAny choices value =
-  any (\choice -> T.toCaseFold choice == T.toCaseFold value) choices
+  any (`textEqualsFold` value) choices
+
+textEqualsFold :: Text -> Text -> Bool
+textEqualsFold left right = T.toCaseFold left == T.toCaseFold right
 
 isTransientDelayError :: Text -> Bool
 isTransientDelayError err =

@@ -85,13 +85,17 @@ instance ToJSON TestResult where
               delays
         ]
 
-renderVersion :: Text -> VersionResponse -> Text
-renderVersion localVersion versionInfo =
-  T.intercalate
-    "  "
-    [ "boxctl " <> localVersion,
-      "server=" <> renderVersionLabel versionInfo
-    ]
+renderVersion :: Text -> Maybe VersionResponse -> Text
+renderVersion localVersion maybeVersionInfo =
+  case maybeVersionInfo of
+    Nothing ->
+      "boxctl " <> localVersion
+    Just versionInfo ->
+      T.intercalate
+        "  "
+        [ "boxctl " <> localVersion,
+          "server=" <> renderVersionLabel versionInfo
+        ]
 
 renderMode :: ConfigResponse -> Text
 renderMode config =
