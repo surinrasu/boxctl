@@ -8,7 +8,10 @@ module Boxctl.Instance
 where
 
 import Boxctl.API (ResolvedInstance (..))
+import Boxctl.Error (InstanceError (..))
 import Control.Applicative ((<|>))
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (ExceptT (..))
 import Data.Aeson ((.:?))
 import qualified Data.Aeson as Aeson
 import Data.Bifunctor (first)
@@ -21,15 +24,16 @@ import qualified Data.Text as T
 import System.Directory (doesDirectoryExist, doesFileExist)
 import System.Environment (lookupEnv)
 import System.FilePath (hasDrive, isPathSeparator, takeExtension)
+import Text.Read (readMaybe)
 
 defaultControllerAddress :: Text
 defaultControllerAddress = "127.0.0.1:9090"
 
-data ConfigFile = ConfigFile
+newtype ConfigFile = ConfigFile
   { configExperimental :: Maybe ExperimentalBlock
   }
 
-data ExperimentalBlock = ExperimentalBlock
+newtype ExperimentalBlock = ExperimentalBlock
   { experimentalClashApi :: Maybe ClashAPIBlock
   }
 
@@ -52,28 +56,25 @@ instance Aeson.FromJSON ClashAPIBlock where
       <$> obj .:? "external_controller"
       <*> obj .:? "secret"
 
-resolveInstance :: Maybe FilePath -> IO (Either Text ResolvedInstance)
+resolveInstance :: Maybe FilePath -> ExceptT InstanceError IO ResolvedInstance
 resolveInstance cliInstance = do
-  envInstance <- lookupEnv "BOXCTL_INSTANCE"
-  envSecret <- fmap T.pack <$> lookupEnv "BOXCTL_SECRET"
+  envInstance <- liftIO (lookupEnv "BOXCTL_INSTANCE")
+  envSecret <- liftIO (fmap T.pack <$> lookupEnv "BOXCTL_SECRET")
   let target = fromMaybe (T.unpack defaultControllerAddress) (cliInstance <|> envInstance)
-  directoryExists <- doesDirectoryExist target
+  directoryExists <- liftIO (doesDirectoryExist target)
   if directoryExists
-    then pure (Left "instance path must be a config file, not a directory")
+    then ExceptT (pure (Left InstancePathIsDirectory))
     else do
-      fileExists <- doesFileExist target
-      targetResult <-
+      fileExists <- liftIO (doesFileExist target)
+      resolved <-
         if fileExists
           then resolveFromConfig target
           else
-            pure $
+            exceptEither $
               if looksLikeConfigPath target
-                then Left ("instance config file not found: " <> T.pack target)
+                then Left (InstanceConfigFileNotFound target)
                 else resolveFromAddress (T.pack target)
-      pure $
-        fmap
-          (\resolved -> resolved {resolvedSecret = envSecret <|> resolvedSecret resolved})
-          targetResult
+      pure resolved {resolvedSecret = envSecret <|> resolvedSecret resolved}
 
 looksLikeConfigPath :: FilePath -> Bool
 looksLikeConfigPath target =
@@ -83,36 +84,32 @@ looksLikeConfigPath target =
            || map toLower (takeExtension target) `elem` [".json", ".jsonc"]
        )
 
-resolveFromConfig :: FilePath -> IO (Either Text ResolvedInstance)
+resolveFromConfig :: FilePath -> ExceptT InstanceError IO ResolvedInstance
 resolveFromConfig configPath = do
-  configBytes <- BS.readFile configPath
+  configBytes <- liftIO (BS.readFile configPath)
   let sanitized = stripJsonComments configBytes
-  pure $ do
-    config <- first (("failed to parse config file: " <>) . T.pack) (Aeson.eitherDecodeStrict' sanitized)
-    clashApi <- maybe (Left "config file does not contain experimental.clash_api") Right (configExperimental config >>= experimentalClashApi)
-    externalController <-
-      maybe
-        (Left "config file does not contain experimental.clash_api.external_controller")
-        Right
-        (clashApiExternalController clashApi)
+  exceptEither $ do
+    config <- first (InstanceConfigParseError . T.pack) (Aeson.eitherDecodeStrict' sanitized)
+    clashApi <- maybe (Left MissingClashApiConfig) Right (configExperimental config >>= experimentalClashApi)
+    externalController <- maybe (Left MissingExternalController) Right (clashApiExternalController clashApi)
     normalized <- resolveFromAddress externalController
     Right normalized {resolvedSecret = clashApiSecret clashApi}
 
-resolveFromAddress :: Text -> Either Text ResolvedInstance
+resolveFromAddress :: Text -> Either InstanceError ResolvedInstance
 resolveFromAddress rawAddress = do
   baseUrl <- normalizeControllerAddress rawAddress
   Right ResolvedInstance {resolvedBaseUrl = baseUrl, resolvedSecret = Nothing}
 
-normalizeControllerAddress :: Text -> Either Text Text
+normalizeControllerAddress :: Text -> Either InstanceError Text
 normalizeControllerAddress rawValue
-  | T.null trimmed = Left "instance address is empty"
+  | T.null trimmed = Left (InvalidInstanceAddress "instance address is empty")
   | "://" `T.isInfixOf` trimmed = Right (T.dropWhileEnd (== '/') trimmed)
   | T.isPrefixOf "[" trimmed = normalizeBracketedAddress trimmed
   | otherwise = normalizeSimpleAddress trimmed
   where
     trimmed = T.strip rawValue
 
-normalizeSimpleAddress :: Text -> Either Text Text
+normalizeSimpleAddress :: Text -> Either InstanceError Text
 normalizeSimpleAddress rawAddress =
   case T.splitOn ":" rawAddress of
     [host] ->
@@ -122,13 +119,13 @@ normalizeSimpleAddress rawAddress =
     [host, port] ->
       buildBaseUrl (normalizeHost False host) port
     _ ->
-      Left "invalid instance address; bracket IPv6 literals like [::1]:9090"
+      Left (InvalidInstanceAddress "invalid instance address; bracket IPv6 literals like [::1]:9090")
 
-normalizeBracketedAddress :: Text -> Either Text Text
+normalizeBracketedAddress :: Text -> Either InstanceError Text
 normalizeBracketedAddress rawAddress =
   let (rawHost, rest) = T.breakOn "]" (T.drop 1 rawAddress)
    in if T.null rest
-        then Left "invalid bracketed instance address"
+        then Left (InvalidInstanceAddress "invalid bracketed instance address")
         else
           let portPart = T.drop 1 rest
               host = normalizeHost True rawHost
@@ -137,12 +134,12 @@ normalizeBracketedAddress rawAddress =
                 p ->
                   case T.stripPrefix ":" p of
                     Just port -> buildBaseUrl host port
-                    Nothing -> Left "invalid bracketed instance address"
+                    Nothing -> Left (InvalidInstanceAddress "invalid bracketed instance address")
 
-buildBaseUrl :: Text -> Text -> Either Text Text
+buildBaseUrl :: Text -> Text -> Either InstanceError Text
 buildBaseUrl host port
-  | T.null host = Left "instance host is empty"
-  | not (validPort port) = Left "instance port must be in the range 1-65535"
+  | T.null host = Left (InvalidInstanceAddress "instance host is empty")
+  | not (validPort port) = Left (InvalidInstanceAddress "instance port must be in the range 1-65535")
   | needsBrackets host = Right ("http://[" <> host <> "]:" <> port)
   | otherwise = Right ("http://" <> host <> ":" <> port)
 
@@ -150,8 +147,9 @@ validPort :: Text -> Bool
 validPort port
   | T.null port = False
   | T.all isDigit port =
-      let value = read (T.unpack port) :: Int
-       in value >= 1 && value <= 65535
+      case readMaybe (T.unpack port) of
+        Just value -> value >= (1 :: Int) && value <= 65535
+        Nothing -> False
   | otherwise = False
 
 normalizeHost :: Bool -> Text -> Text
@@ -199,3 +197,7 @@ stripJsonComments = BS.pack . goNormal . BS.unpack
       | char == 10 = 10 : goBlockComment rest
       | char == 13 = 13 : goBlockComment rest
       | otherwise = goBlockComment rest
+
+exceptEither :: Monad m => Either e a -> ExceptT e m a
+exceptEither =
+  ExceptT . pure

@@ -101,10 +101,10 @@ renderMode :: ConfigResponse -> Text
 renderMode config =
   T.intercalate
     "  "
-    (["mode: " <> configMode config] <> availableModeLines config)
+    (["mode: " <> clashModeText (configMode config)] <> availableModeLines config)
 
 renderSwitch :: ConfigResponse -> Text
-renderSwitch config = "mode: " <> configMode config
+renderSwitch config = "mode: " <> clashModeText (configMode config)
 
 renderSelect :: Text -> Text -> Text
 renderSelect selectorName optionName =
@@ -163,15 +163,15 @@ renderGroupDetails renderStyle proxyIndex proxy =
       [ proxyName proxy <> "  " <> renderTypeText renderStyle (proxyTypeLabel proxy)
       ]
     detailsLines =
-      [ "current: " <> fromMaybe "-" (proxyNow proxy),
+      [ "current: " <> fromMaybe "-" (proxyCurrent proxy),
         "options: " <> T.pack (show (length members))
       ]
         <> maybe [] (\history -> ["last: " <> historySummary renderStyle history]) (latestHistory proxy)
-    members = fromMaybe [] (proxyAll proxy)
+    members = proxyMembers proxy
     memberLines =
       if null members
         then ["  none"]
-        else renderMemberRows renderStyle proxyIndex (proxyNow proxy) members
+        else renderMemberRows renderStyle proxyIndex (proxyCurrent proxy) members
 
 renderLeafDetails :: RenderStyle -> ProxyInfo -> Text
 renderLeafDetails renderStyle proxy =
@@ -199,10 +199,10 @@ renderTestResults renderStyle =
         ]
     renderResult (GroupDelay proxy delays) =
       T.unlines $
-        [ proxyName proxy <> "  " <> renderTypeText renderStyle (proxyTypeLabel proxy) <> currentSuffix (proxyNow proxy),
+        [ proxyName proxy <> "  " <> renderTypeText renderStyle (proxyTypeLabel proxy) <> currentSuffix (proxyCurrent proxy),
           ""
         ]
-          <> renderDelayRows renderStyle (proxyNow proxy) delays
+          <> renderDelayRows renderStyle (proxyCurrent proxy) delays
 
 renderDelayStatus :: RenderStyle -> DelayStatus -> Text
 renderDelayStatus renderStyle = \case
@@ -230,14 +230,14 @@ availableModeLines config =
   case dedupeModes (configModeList config) of
     [] -> []
     [onlyMode]
-      | equalsFold onlyMode (configMode config) -> []
-    modes -> ["available=" <> T.intercalate ", " modes]
+      | onlyMode == configMode config -> []
+    modes -> ["available=" <> T.intercalate ", " (map clashModeText modes)]
 
-dedupeModes :: [Text] -> [Text]
+dedupeModes :: [ClashMode] -> [ClashMode]
 dedupeModes = foldl insertMode []
   where
     insertMode acc mode
-      | any (`equalsFold` mode) acc = acc
+      | mode `elem` acc = acc
       | otherwise = acc <> [mode]
 
 renderGroupRows :: RenderStyle -> [ProxyInfo] -> [Text]
@@ -351,8 +351,8 @@ groupKindRank proxy
 groupSummaryParts :: RenderStyle -> ProxyInfo -> [Text]
 groupSummaryParts renderStyle proxy =
   catMaybes
-    [ fmap ("current=" <>) (proxyNow proxy),
-      fmap (\members -> T.pack (show (length members)) <> " options") (proxyAll proxy),
+    [ fmap ("current=" <>) (proxyCurrent proxy),
+      Just (T.pack (show (length (proxyMembers proxy))) <> " options"),
       fmap (\history -> "last=" <> renderDelayMs renderStyle (historyDelay history)) (latestHistory proxy)
     ]
 
@@ -396,19 +396,10 @@ proxyTypeLabel :: ProxyInfo -> Text
 proxyTypeLabel proxy
   | isUrlTestProxy proxy = "url-test"
   | isSelectorProxy proxy = "selector"
-  | otherwise = T.toLower (proxyType proxy)
+  | otherwise = proxyKindText (proxyKind proxy)
 
 proxyNameKey :: ProxyInfo -> Text
 proxyNameKey = T.toCaseFold . proxyName
-
-isGroupProxy :: ProxyInfo -> Bool
-isGroupProxy proxy = maybe False (const True) (proxyAll proxy)
-
-isSelectorProxy :: ProxyInfo -> Bool
-isSelectorProxy proxy = equalsFold (proxyType proxy) "Selector"
-
-isUrlTestProxy :: ProxyInfo -> Bool
-isUrlTestProxy proxy = equalsFold (proxyType proxy) "URLTest"
 
 currentMarker :: Maybe Text -> Text -> Text
 currentMarker current memberName

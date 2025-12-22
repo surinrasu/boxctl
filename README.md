@@ -1,27 +1,50 @@
 # boxctl
-CLI controller for sing-box
+![](./banner.png)
+
+## Usage
 
 ```shell
 boxctl [OPTION] <COMMAND>
 ```
 
-- **options**:
+### Options
+
   - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance, defaults to `127.0.0.1:9090`
   - `--verbose`                             Verbose output
   - `--json`                                Emit JSON output
   - `--color <auto|always|never>`           Colorise human output, defaults to `auto`
   - `--help`                                Show this help text
 
-- **commands**:
+### Commands
   - `version`                               Show version
   - `mode`                                  Show current Clash mode
   - `switch <CLASH_MODE>`                   Switch Clash mode
   - `list`                                  List groups
   - `show [OUTBOUND1] [OUTBOUND2] [...]`    Show details of outbounds
   - `test [OUTBOUND1] [OUTBOUND2] [...]`    Test delays of outbounds
-  - `select [SELECTOR] <OPTION>`            Select an option for a selector
+  - `select <OPTION>`                       Select an option when only one selector exists
+  - `select <SELECTOR> <OPTION>`            Select an option for a specific selector
 
-- **environment**:
+### Env Variables
   - `BOXCTL_INSTANCE`                       Default target
   - `BOXCTL_SECRET`                         Default secret
   - `BOXCTL_BACKGROUND=<dark|light>`        Override auto background detection
+
+## Develop
+
+It uses [mise](mise.jdx.dev) to manage toolchain:
+
+```shell
+mise install
+cabal build
+
+cabal run boxctl # Use -- to pass params
+```
+
+## License
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more details.
+
+You should have received a copy of the GNU Lesser General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.

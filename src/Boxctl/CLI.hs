@@ -9,15 +9,15 @@ module Boxctl.CLI
     OutputMode (..),
     ProxyFilter (..),
     ProxySelection (..),
+    SelectCommand (..),
     parseOptions,
   )
 where
 
+import Boxctl.API (ClashMode, clashModeFromText)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Options.Applicative
-import System.Exit (exitFailure)
-import qualified System.IO as IO
 
 data Options = Options
   { optInstance :: Maybe FilePath,
@@ -42,11 +42,11 @@ data ColorMode
 data Command
   = CmdVersion
   | CmdMode
-  | CmdSwitch Text
+  | CmdSwitch ClashMode
   | CmdList ListOptions
   | CmdShow ProxySelection
   | CmdTest ProxySelection
-  | CmdSelect [Text]
+  | CmdSelect SelectCommand
   deriving (Eq, Show)
 
 data ListOptions = ListOptions
@@ -64,25 +64,22 @@ data ProxyFilter
   = FilterAll
   | FilterSelectors
   | FilterUrlTests
-  | FilterConflict
+  deriving (Eq, Show)
+
+data SelectCommand
+  = SelectByOption Text
+  | SelectBySelector Text Text
   deriving (Eq, Show)
 
 parseOptions :: IO Options
-parseOptions = do
-  options <-
-    execParser $
-      info
-        (optionsParser <**> helper)
-        ( fullDesc
-            <> progDesc "Cli controller for sing-box"
-            <> header "boxctl"
-        )
-  case validateOptions options of
-    Left err -> do
-      IO.hPutStrLn IO.stderr ("boxctl: " <> T.unpack err)
-      exitFailure
-    Right validOptions ->
-      pure validOptions
+parseOptions =
+  execParser $
+    info
+      (optionsParser <**> helper)
+      ( fullDesc
+          <> progDesc "Cli controller for sing-box"
+          <> header "boxctl"
+      )
 
 optionsParser :: Parser Options
 optionsParser =
@@ -128,8 +125,8 @@ commandParser =
 
 switchParser :: Parser Command
 switchParser =
-  CmdSwitch . T.pack
-    <$> strArgument
+  CmdSwitch
+    <$> argument clashModeReader
       ( metavar "CLASH_MODE"
           <> help "Target Clash mode"
       )
@@ -165,60 +162,31 @@ proxySelectionParser =
 
 proxyFilterParser :: Parser ProxyFilter
 proxyFilterParser =
-  toFilter
-    <$> switch
-      ( long "selectors"
-          <> short 's'
-          <> help "Only show selectors"
-      )
-    <*> switch
+  flag' FilterSelectors
+    ( long "selectors"
+        <> short 's'
+        <> help "Only show selectors"
+    )
+    <|> flag' FilterUrlTests
       ( long "url-tests"
           <> short 'u'
           <> help "Only show url-tests"
       )
-  where
-    toFilter True False = FilterSelectors
-    toFilter False True = FilterUrlTests
-    toFilter False False = FilterAll
-    toFilter True True = FilterConflict
+    <|> pure FilterAll
 
 selectParser :: Parser Command
 selectParser =
   CmdSelect
-    <$> some
-      ( T.pack
-          <$> strArgument
-            ( metavar "[SELECTOR] <OPTION>"
-                <> help "Either OPTION or SELECTOR OPTION"
-            )
-      )
+    <$> ( buildSelectCommand
+            <$> textArgument "SELECTOR_OR_OPTION" "Selector outbound name, or target option when used alone"
+            <*> optional (textArgument "OPTION" "Target option name")
+        )
 
-validateOptions :: Options -> Either Text Options
-validateOptions options = do
-  validatedCommand <- validateCommand (optCommand options)
-  Right (options {optCommand = validatedCommand})
-
-validateCommand :: Command -> Either Text Command
-validateCommand = \case
-  CmdShow selection ->
-    CmdShow <$> validateSelection selection
-  CmdTest selection ->
-    CmdTest <$> validateSelection selection
-  CmdSelect args ->
-    case args of
-      [_] -> Right (CmdSelect args)
-      [_, _] -> Right (CmdSelect args)
-      _ -> Left "select expects one or two positional arguments"
-  other ->
-    Right other
-
-validateSelection :: ProxySelection -> Either Text ProxySelection
-validateSelection selection =
-  case selectionFilter selection of
-    FilterConflict ->
-      Left "options --selectors and --url-tests are mutually exclusive"
-    _ ->
-      Right selection
+buildSelectCommand :: Text -> Maybe Text -> SelectCommand
+buildSelectCommand selectorOrOption maybeOption =
+  case maybeOption of
+    Nothing -> SelectByOption selectorOrOption
+    Just optionName -> SelectBySelector selectorOrOption optionName
 
 colorModeReader :: ReadM ColorMode
 colorModeReader =
@@ -228,3 +196,15 @@ colorModeReader =
       "always" -> Right ColorAlways
       "never" -> Right ColorNever
       _ -> Left "expected one of: auto, always, never"
+
+clashModeReader :: ReadM ClashMode
+clashModeReader =
+  eitherReader (Right . clashModeFromText . T.pack)
+
+textArgument :: String -> String -> Parser Text
+textArgument name description =
+  T.pack
+    <$> strArgument
+      ( metavar name
+          <> help description
+      )

@@ -1,27 +1,45 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Boxctl.API
-  ( ConfigResponse (..),
+  ( ClashMode (..),
+    ConfigResponse (..),
     Controller,
     DelayHistory (..),
     DelayResponse (..),
+    GroupInfo (..),
     ProxyInfo (..),
+    ProxyKind (..),
+    ProxyScope (..),
     ResolvedInstance (..),
     VersionResponse (..),
+    clashModeFromText,
+    clashModeText,
     fetchConfigs,
+    isGroupProxy,
+    isSelectorProxy,
+    isUrlTestProxy,
     fetchGroupDelay,
     fetchProxies,
     fetchProxyDelay,
     fetchVersion,
     mkController,
+    proxyCurrent,
+    proxyKindText,
+    proxyMembers,
     selectProxyOption,
     switchMode,
   )
 where
 
-import Control.Exception (SomeException, try)
-import Control.Monad (when)
+import Boxctl.Error (ApiError (..), TransportError (..))
+import Control.Exception (try)
+import Control.Monad (void, when)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Trans.Except (ExceptT (..), throwE)
 import Data.Aeson
+import Data.Aeson.Types (Parser)
+import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as BL
@@ -34,11 +52,38 @@ import Data.Text.Encoding.Error (lenientDecode)
 import qualified Data.Text.IO as TIO
 import Data.Time (UTCTime)
 import Network.HTTP.Client
+  ( HttpException (..),
+    HttpExceptionContent (..),
+    Manager,
+    RequestBody (..),
+    Response,
+    httpLbs,
+    method,
+    parseRequest,
+    requestBody,
+    requestHeaders,
+    responseBody,
+    responseStatus,
+  )
 import Network.HTTP.Client.TLS (newTlsManager)
 import Network.HTTP.Types (methodGet, methodPatch, methodPut)
 import Network.HTTP.Types.Status (statusCode)
 import Network.HTTP.Types.URI (renderQuery, urlEncode)
 import System.IO (stderr)
+
+data ClashMode
+  = ClashModeRule
+  | ClashModeGlobal
+  | ClashModeDirect
+  | ClashModeScript
+  | ClashModeUnknown Text
+  deriving (Eq, Show)
+
+data ProxyKind
+  = ProxySelector
+  | ProxyUrlTest
+  | ProxyOther Text
+  deriving (Eq, Show)
 
 data ResolvedInstance = ResolvedInstance
   { resolvedBaseUrl :: Text,
@@ -60,8 +105,8 @@ data VersionResponse = VersionResponse
   deriving (Eq, Show)
 
 data ConfigResponse = ConfigResponse
-  { configMode :: Text,
-    configModeList :: [Text]
+  { configMode :: ClashMode,
+    configModeList :: [ClashMode]
   }
   deriving (Eq, Show)
 
@@ -72,12 +117,22 @@ data DelayHistory = DelayHistory
   deriving (Eq, Show)
 
 data ProxyInfo = ProxyInfo
-  { proxyType :: Text,
+  { proxyKind :: ProxyKind,
     proxyName :: Text,
     proxyUdp :: Bool,
     proxyHistory :: [DelayHistory],
-    proxyNow :: Maybe Text,
-    proxyAll :: Maybe [Text]
+    proxyScope :: ProxyScope
+  }
+  deriving (Eq, Show)
+
+data ProxyScope
+  = ProxyLeaf
+  | ProxyGroup GroupInfo
+  deriving (Eq, Show)
+
+data GroupInfo = GroupInfo
+  { groupCurrent :: Maybe Text,
+    groupMembers :: [Text]
   }
   deriving (Eq, Show)
 
@@ -86,13 +141,27 @@ newtype DelayResponse = DelayResponse
   }
   deriving (Eq, Show)
 
-data ProxyEnvelope = ProxyEnvelope
+newtype ProxyEnvelope = ProxyEnvelope
   { envelopeProxies :: Map Text ProxyInfo
   }
 
-data ErrorResponse = ErrorResponse
-  { errorMessage :: Text
-  }
+newtype ErrorResponse = ErrorResponse Text
+
+newtype ModePatch = ModePatch ClashMode
+
+newtype SelectRequest = SelectRequest Text
+
+instance FromJSON ClashMode where
+  parseJSON = withText "ClashMode" (pure . clashModeFromText)
+
+instance ToJSON ClashMode where
+  toJSON = String . clashModeText
+
+instance FromJSON ProxyKind where
+  parseJSON = withText "ProxyKind" (pure . proxyKindFromText)
+
+instance ToJSON ProxyKind where
+  toJSON = String . proxyKindText
 
 instance FromJSON VersionResponse where
   parseJSON = withObject "VersionResponse" $ \obj ->
@@ -142,19 +211,24 @@ instance FromJSON ProxyInfo where
       <*> obj .: "name"
       <*> obj .:? "udp" .!= False
       <*> obj .:? "history" .!= []
-      <*> obj .:? "now"
-      <*> obj .:? "all"
+      <*> parseProxyScope obj
 
 instance ToJSON ProxyInfo where
   toJSON proxy =
-    object
-      [ "type" .= proxyType proxy,
-        "name" .= proxyName proxy,
-        "udp" .= proxyUdp proxy,
-        "history" .= proxyHistory proxy,
-        "now" .= proxyNow proxy,
-        "all" .= proxyAll proxy
-      ]
+    object (baseFields <> scopeFields (proxyScope proxy))
+    where
+      baseFields =
+        [ "type" .= proxyKind proxy,
+          "name" .= proxyName proxy,
+          "udp" .= proxyUdp proxy,
+          "history" .= proxyHistory proxy
+        ]
+
+      scopeFields ProxyLeaf = []
+      scopeFields (ProxyGroup groupInfo) =
+        [ "now" .= groupCurrent groupInfo,
+          "all" .= groupMembers groupInfo
+        ]
 
 instance FromJSON DelayResponse where
   parseJSON = withObject "DelayResponse" $ \obj ->
@@ -182,9 +256,53 @@ instance ToJSON SelectRequest where
   toJSON (SelectRequest name) =
     object ["name" .= name]
 
-data ModePatch = ModePatch Text
+clashModeFromText :: Text -> ClashMode
+clashModeFromText rawValue =
+  case normalized of
+    "rule" -> ClashModeRule
+    "global" -> ClashModeGlobal
+    "direct" -> ClashModeDirect
+    "script" -> ClashModeScript
+    other -> ClashModeUnknown other
+  where
+    normalized = T.toCaseFold (T.strip rawValue)
 
-data SelectRequest = SelectRequest Text
+clashModeText :: ClashMode -> Text
+clashModeText = \case
+  ClashModeRule -> "rule"
+  ClashModeGlobal -> "global"
+  ClashModeDirect -> "direct"
+  ClashModeScript -> "script"
+  ClashModeUnknown other -> other
+
+proxyKindFromText :: Text -> ProxyKind
+proxyKindFromText rawValue =
+  case normalized of
+    "selector" -> ProxySelector
+    "urltest" -> ProxyUrlTest
+    "url-test" -> ProxyUrlTest
+    other -> ProxyOther other
+  where
+    normalized = T.toCaseFold (T.strip rawValue)
+
+proxyKindText :: ProxyKind -> Text
+proxyKindText = \case
+  ProxySelector -> "selector"
+  ProxyUrlTest -> "url-test"
+  ProxyOther other -> other
+
+parseProxyScope :: Object -> Parser ProxyScope
+parseProxyScope obj = do
+  maybeMembers <- obj .:? "all"
+  case maybeMembers of
+    Nothing ->
+      pure ProxyLeaf
+    Just members ->
+      ProxyGroup
+        <$> ( GroupInfo
+                <$> obj .:? "now"
+                <*> pure members
+            )
 
 mkController :: ResolvedInstance -> Bool -> IO Controller
 mkController controllerInstance controllerVerbose = do
@@ -196,38 +314,59 @@ mkController controllerInstance controllerVerbose = do
         controllerVerbose = controllerVerbose
       }
 
-fetchVersion :: Controller -> IO (Either Text VersionResponse)
+fetchVersion :: Controller -> ExceptT ApiError IO VersionResponse
 fetchVersion controller =
   requestJson controller methodGet ["version"] [] Nothing
 
-fetchConfigs :: Controller -> IO (Either Text ConfigResponse)
+fetchConfigs :: Controller -> ExceptT ApiError IO ConfigResponse
 fetchConfigs controller =
   requestJson controller methodGet ["configs"] [] Nothing
 
-switchMode :: Controller -> Text -> IO (Either Text ())
+switchMode :: Controller -> ClashMode -> ExceptT ApiError IO ()
 switchMode controller newMode =
   requestNoContent controller methodPatch ["configs"] [] (Just (toJSON (ModePatch newMode)))
 
-fetchProxies :: Controller -> IO (Either Text [ProxyInfo])
+fetchProxies :: Controller -> ExceptT ApiError IO [ProxyInfo]
 fetchProxies controller = do
-  result <- requestJson controller methodGet ["proxies"] [] Nothing
-  pure $ fmap extractProxies result
-  where
-    extractProxies :: ProxyEnvelope -> [ProxyInfo]
-    extractProxies =
-      filter (\proxy -> proxyName proxy /= "GLOBAL")
-        . Map.elems
-        . envelopeProxies
+  envelope <- requestJson controller methodGet ["proxies"] [] Nothing
+  pure $
+    filter (\proxy -> proxyName proxy /= "GLOBAL") $
+      Map.elems $
+        envelopeProxies envelope
 
-fetchProxyDelay :: Controller -> Text -> Int -> IO (Either Text DelayResponse)
+isGroupProxy :: ProxyInfo -> Bool
+isGroupProxy proxy =
+  case proxyScope proxy of
+    ProxyLeaf -> False
+    ProxyGroup _ -> True
+
+isSelectorProxy :: ProxyInfo -> Bool
+isSelectorProxy proxy = proxyKind proxy == ProxySelector
+
+isUrlTestProxy :: ProxyInfo -> Bool
+isUrlTestProxy proxy = proxyKind proxy == ProxyUrlTest
+
+proxyCurrent :: ProxyInfo -> Maybe Text
+proxyCurrent proxy =
+  case proxyScope proxy of
+    ProxyLeaf -> Nothing
+    ProxyGroup groupInfo -> groupCurrent groupInfo
+
+proxyMembers :: ProxyInfo -> [Text]
+proxyMembers proxy =
+  case proxyScope proxy of
+    ProxyLeaf -> []
+    ProxyGroup groupInfo -> groupMembers groupInfo
+
+fetchProxyDelay :: Controller -> Text -> Int -> ExceptT ApiError IO DelayResponse
 fetchProxyDelay controller proxyName timeoutMs =
   requestJson controller methodGet ["proxies", proxyName, "delay"] (delayQuery timeoutMs) Nothing
 
-fetchGroupDelay :: Controller -> Text -> Int -> IO (Either Text (Map Text Int))
+fetchGroupDelay :: Controller -> Text -> Int -> ExceptT ApiError IO (Map Text Int)
 fetchGroupDelay controller proxyName timeoutMs =
   requestJson controller methodGet ["group", proxyName, "delay"] (delayQuery timeoutMs) Nothing
 
-selectProxyOption :: Controller -> Text -> Text -> IO (Either Text ())
+selectProxyOption :: Controller -> Text -> Text -> ExceptT ApiError IO ()
 selectProxyOption controller selectorName optionName =
   requestNoContent controller methodPut ["proxies", selectorName] [] (Just (toJSON (SelectRequest optionName)))
 
@@ -244,17 +383,15 @@ requestJson ::
   [Text] ->
   [(BS.ByteString, Maybe BS.ByteString)] ->
   Maybe Value ->
-  IO (Either Text a)
+  ExceptT ApiError IO a
 requestJson controller requestMethod pathSegments queryParams requestBody = do
-  response <- performRequest controller requestMethod pathSegments queryParams requestBody
-  pure $ do
-    httpResponse <- response
-    body <- responseBodyOrError httpResponse
-    case eitherDecode body of
-      Left err ->
-        Left ("failed to decode API response: " <> T.pack err)
-      Right value ->
-        Right value
+  httpResponse <- performRequest controller requestMethod pathSegments queryParams requestBody
+  body <- exceptEither (responseBodyOrError httpResponse)
+  case eitherDecode body of
+    Left err ->
+      throwE (ApiDecodeError (T.pack err))
+    Right value ->
+      pure value
 
 requestNoContent ::
   Controller ->
@@ -262,13 +399,10 @@ requestNoContent ::
   [Text] ->
   [(BS.ByteString, Maybe BS.ByteString)] ->
   Maybe Value ->
-  IO (Either Text ())
+  ExceptT ApiError IO ()
 requestNoContent controller requestMethod pathSegments queryParams requestBody = do
-  response <- performRequest controller requestMethod pathSegments queryParams requestBody
-  pure $ do
-    httpResponse <- response
-    _ <- responseBodyOrError httpResponse
-    Right ()
+  httpResponse <- performRequest controller requestMethod pathSegments queryParams requestBody
+  void (exceptEither (responseBodyOrError httpResponse))
 
 performRequest ::
   Controller ->
@@ -276,59 +410,67 @@ performRequest ::
   [Text] ->
   [(BS.ByteString, Maybe BS.ByteString)] ->
   Maybe Value ->
-  IO (Either Text (Response BL.ByteString))
+  ExceptT ApiError IO (Response BL.ByteString)
 performRequest controller requestMethod pathSegments queryParams requestBody = do
   let manager = controllerManager controller
       ResolvedInstance {resolvedBaseUrl, resolvedSecret} = controllerInstance controller
       verbose = controllerVerbose controller
       url = buildUrl resolvedBaseUrl pathSegments queryParams
-  when verbose $
-    TIO.hPutStrLn stderr ("[http] " <> decodeUtf8 requestMethod <> " " <> T.pack url)
-  requestResult <- try (parseRequest url) :: IO (Either SomeException Request)
-  case requestResult of
-    Left err ->
-      pure (Left ("failed to build request: " <> T.pack (show err)))
-    Right initialRequest -> do
-      let authHeader =
-            maybe [] (\secret -> [("Authorization", TE.encodeUtf8 ("Bearer " <> secret))]) resolvedSecret
-          jsonRequestBody = maybe (RequestBodyBS BS.empty) (RequestBodyLBS . encode) requestBody
-          extraHeaders =
-            if maybe False (const True) requestBody
-              then ("Content-Type", "application/json") : authHeader
-              else authHeader
-          request =
-            initialRequest
-              { method = requestMethod,
-                requestHeaders = extraHeaders ++ requestHeaders initialRequest,
-                requestBody = jsonRequestBody
-              }
-      responseResult <- try (httpLbs request manager) :: IO (Either SomeException (Response BL.ByteString))
-      case responseResult of
-        Left err ->
-          pure (Left ("request failed: " <> T.pack (show err)))
-        Right response -> do
-          when verbose $
-            TIO.hPutStrLn stderr ("[http] <- " <> T.pack (show (statusCode (responseStatus response))))
-          pure (Right response)
+  liftIO $
+    when verbose $
+      TIO.hPutStrLn stderr ("[http] " <> decodeUtf8 requestMethod <> " " <> T.pack url)
+  initialRequest <- ExceptT $
+    first mapHttpException <$> try (parseRequest url)
+  let authHeader =
+        maybe [] (\secret -> [("Authorization", TE.encodeUtf8 ("Bearer " <> secret))]) resolvedSecret
+      jsonRequestBody = maybe (RequestBodyBS BS.empty) (RequestBodyLBS . encode) requestBody
+      extraHeaders =
+        if maybe False (const True) requestBody
+          then ("Content-Type", "application/json") : authHeader
+          else authHeader
+      request =
+        initialRequest
+          { method = requestMethod,
+            requestHeaders = extraHeaders ++ requestHeaders initialRequest,
+            requestBody = jsonRequestBody
+          }
+  response <- ExceptT $
+    first mapHttpException <$> try (httpLbs request manager)
+  liftIO $
+    when verbose $
+      TIO.hPutStrLn stderr ("[http] <- " <> T.pack (show (statusCode (responseStatus response))))
+  pure response
 
-responseBodyOrError :: Response BL.ByteString -> Either Text BL.ByteString
+responseBodyOrError :: Response BL.ByteString -> Either ApiError BL.ByteString
 responseBodyOrError response
   | statusCode status >= 200 && statusCode status < 300 = Right (responseBody response)
-  | otherwise = Left (renderError response)
+  | otherwise = Left (ApiHttpError (statusCode status) (responseErrorMessage response))
   where
     status = responseStatus response
 
-renderError :: Response BL.ByteString -> Text
-renderError response =
-  let status = responseStatus response
-      prefix = "HTTP " <> T.pack (show (statusCode status))
-   in case eitherDecode (responseBody response) of
-        Right (ErrorResponse message) -> prefix <> ": " <> message
-        Left _ ->
-          let body = decodeUtf8 (BL.toStrict (responseBody response))
-           in if T.null body
-                then prefix
-                else prefix <> ": " <> body
+responseErrorMessage :: Response BL.ByteString -> Maybe Text
+responseErrorMessage response =
+  case eitherDecode (responseBody response) of
+    Right (ErrorResponse message) ->
+      Just message
+    Left _ ->
+      let body = decodeUtf8 (BL.toStrict (responseBody response))
+       in if T.null body
+            then Nothing
+            else Just body
+
+mapHttpException :: HttpException -> ApiError
+mapHttpException = \case
+  InvalidUrlException _ message ->
+    ApiRequestBuildError (T.pack message)
+  HttpExceptionRequest _ content ->
+    ApiTransportError (mapTransportError content)
+
+mapTransportError :: HttpExceptionContent -> TransportError
+mapTransportError = \case
+  ConnectionTimeout -> TransportTimeout
+  ResponseTimeout -> TransportTimeout
+  other -> TransportFailure (T.pack (show other))
 
 buildUrl :: Text -> [Text] -> [(BS.ByteString, Maybe BS.ByteString)] -> String
 buildUrl baseUrl pathSegments queryParams =
@@ -345,3 +487,7 @@ renderPathSegment =
 
 decodeUtf8 :: BS.ByteString -> Text
 decodeUtf8 = TE.decodeUtf8With lenientDecode
+
+exceptEither :: Monad m => Either e a -> ExceptT e m a
+exceptEither =
+  ExceptT . pure

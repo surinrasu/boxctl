@@ -51,10 +51,12 @@ library
       Paths_boxctl
   other-modules:
       Paths_boxctl
+    , Boxctl.Terminal
   exposed-modules:
       Boxctl.API
     , Boxctl.CLI
     , Boxctl.Command
+    , Boxctl.Error
     , Boxctl.Instance
     , Boxctl.Output
 
