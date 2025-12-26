@@ -9,7 +9,9 @@ boxctl [OPTION] <COMMAND>
 
 ### Options
 
-  - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance, defaults to `127.0.0.1:9090`
+  - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance, guessed as config path or controller address
+  - `--instance-config <PATH>`              Target instance config file
+  - `--instance-address <ADDR[:<PORT>]>`    Target controller address
   - `--verbose`                             Verbose output
   - `--json`                                Emit JSON output
   - `--color <auto|always|never>`           Colorise human output, defaults to `auto`
@@ -32,7 +34,7 @@ boxctl [OPTION] <COMMAND>
 
 ## Develop
 
-It uses [mise](mise.jdx.dev) to manage toolchain:
+It uses [mise](https://mise.jdx.dev/) to manage toolchain:
 
 ```shell
 mise install

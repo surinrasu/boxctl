@@ -1,13 +1,19 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module Boxctl.Instance
-  ( normalizeControllerAddress,
+  ( ControllerAddress (..),
+    InstanceTarget (..),
+    ResolvedInstance (..),
+    guessInstanceTarget,
+    instanceAddressTarget,
+    instanceConfigTarget,
+    normalizeControllerAddress,
     resolveInstance,
     stripJsonComments,
   )
 where
 
-import Boxctl.API (ResolvedInstance (..))
 import Boxctl.Error (InstanceError (..))
 import Control.Applicative ((<|>))
 import Control.Monad.IO.Class (liftIO)
@@ -25,6 +31,23 @@ import System.Directory (doesDirectoryExist, doesFileExist)
 import System.Environment (lookupEnv)
 import System.FilePath (hasDrive, isPathSeparator, takeExtension)
 import Text.Read (readMaybe)
+
+newtype ControllerAddress = ControllerAddress
+  { unControllerAddress :: Text
+  }
+  deriving (Eq, Show)
+
+data InstanceTarget
+  = InstanceTargetGuess Text
+  | InstanceTargetConfig FilePath
+  | InstanceTargetAddress ControllerAddress
+  deriving (Eq, Show)
+
+data ResolvedInstance = ResolvedInstance
+  { resolvedBaseUrl :: Text,
+    resolvedSecret :: Maybe Text
+  }
+  deriving (Eq, Show)
 
 defaultControllerAddress :: Text
 defaultControllerAddress = "127.0.0.1:9090"
@@ -56,25 +79,58 @@ instance Aeson.FromJSON ClashAPIBlock where
       <$> obj .:? "external_controller"
       <*> obj .:? "secret"
 
-resolveInstance :: Maybe FilePath -> ExceptT InstanceError IO ResolvedInstance
+guessInstanceTarget :: String -> InstanceTarget
+guessInstanceTarget =
+  InstanceTargetGuess . T.pack
+
+instanceConfigTarget :: FilePath -> InstanceTarget
+instanceConfigTarget =
+  InstanceTargetConfig
+
+instanceAddressTarget :: String -> InstanceTarget
+instanceAddressTarget =
+  InstanceTargetAddress . ControllerAddress . T.pack
+
+resolveInstance :: Maybe InstanceTarget -> ExceptT InstanceError IO ResolvedInstance
 resolveInstance cliInstance = do
-  envInstance <- liftIO (lookupEnv "BOXCTL_INSTANCE")
+  envInstance <- liftIO (fmap guessInstanceTarget <$> lookupEnv "BOXCTL_INSTANCE")
   envSecret <- liftIO (fmap T.pack <$> lookupEnv "BOXCTL_SECRET")
-  let target = fromMaybe (T.unpack defaultControllerAddress) (cliInstance <|> envInstance)
+  let target = fromMaybe (InstanceTargetAddress (ControllerAddress defaultControllerAddress)) (cliInstance <|> envInstance)
+  resolved <- resolveTarget target
+  pure resolved {resolvedSecret = envSecret <|> resolvedSecret resolved}
+
+resolveTarget :: InstanceTarget -> ExceptT InstanceError IO ResolvedInstance
+resolveTarget = \case
+  InstanceTargetGuess rawTarget -> resolveGuessedTarget rawTarget
+  InstanceTargetConfig configPath -> resolveConfigTarget configPath
+  InstanceTargetAddress controllerAddress -> exceptEither (resolveFromAddress controllerAddress)
+
+resolveConfigTarget :: FilePath -> ExceptT InstanceError IO ResolvedInstance
+resolveConfigTarget configPath = do
+  directoryExists <- liftIO (doesDirectoryExist configPath)
+  if directoryExists
+    then ExceptT (pure (Left InstancePathIsDirectory))
+    else do
+      fileExists <- liftIO (doesFileExist configPath)
+      if fileExists
+        then resolveFromConfig configPath
+        else ExceptT (pure (Left (InstanceConfigFileNotFound configPath)))
+
+resolveGuessedTarget :: Text -> ExceptT InstanceError IO ResolvedInstance
+resolveGuessedTarget rawTarget = do
+  let target = T.unpack (T.strip rawTarget)
   directoryExists <- liftIO (doesDirectoryExist target)
   if directoryExists
     then ExceptT (pure (Left InstancePathIsDirectory))
     else do
       fileExists <- liftIO (doesFileExist target)
-      resolved <-
-        if fileExists
-          then resolveFromConfig target
-          else
-            exceptEither $
-              if looksLikeConfigPath target
-                then Left (InstanceConfigFileNotFound target)
-                else resolveFromAddress (T.pack target)
-      pure resolved {resolvedSecret = envSecret <|> resolvedSecret resolved}
+      if fileExists
+        then resolveFromConfig target
+        else
+          exceptEither $
+            if looksLikeConfigPath target
+              then Left (InstanceConfigFileNotFound target)
+              else resolveFromAddress (ControllerAddress (T.pack target))
 
 looksLikeConfigPath :: FilePath -> Bool
 looksLikeConfigPath target =
@@ -92,11 +148,11 @@ resolveFromConfig configPath = do
     config <- first (InstanceConfigParseError . T.pack) (Aeson.eitherDecodeStrict' sanitized)
     clashApi <- maybe (Left MissingClashApiConfig) Right (configExperimental config >>= experimentalClashApi)
     externalController <- maybe (Left MissingExternalController) Right (clashApiExternalController clashApi)
-    normalized <- resolveFromAddress externalController
+    normalized <- resolveFromAddress (ControllerAddress externalController)
     Right normalized {resolvedSecret = clashApiSecret clashApi}
 
-resolveFromAddress :: Text -> Either InstanceError ResolvedInstance
-resolveFromAddress rawAddress = do
+resolveFromAddress :: ControllerAddress -> Either InstanceError ResolvedInstance
+resolveFromAddress (ControllerAddress rawAddress) = do
   baseUrl <- normalizeControllerAddress rawAddress
   Right ResolvedInstance {resolvedBaseUrl = baseUrl, resolvedSecret = Nothing}
 

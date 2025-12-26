@@ -13,4 +13,4 @@ hls = "https://github.com/mise-plugins/mise-ghcup"
 [tools]
 ghc = "latest"
 hls = "latest"
-cabal = { version = "latest", postinstall = "cabal install cabal-gild --installdir={{config_root}}/.cabal/bin --overwrite-policy=always" }
+cabal = { version = "latest", postinstall = "cabal install cabal-gild hlint --installdir={{config_root}}/.cabal/bin --overwrite-policy=always" }

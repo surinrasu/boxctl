@@ -3,24 +3,41 @@
 
 module Boxctl.Output
   ( BackgroundTone (..),
+    CommandDiagnostic (..),
+    CommandDiagnosticVisibility (..),
+    CommandOutput (..),
     DelayStatus (..),
     RenderStyle (..),
     TestResult (..),
-    renderList,
-    renderMode,
-    renderProxyDetails,
-    renderSelect,
-    renderSwitch,
-    renderTestResults,
-    renderVersion,
+    emitCommandOutput,
   )
 where
 
-import Boxctl.API
-import Boxctl.CLI (ListOptions (..))
+import Boxctl.CLI (ListOptions (..), OutputMode (..))
+import Boxctl.Domain
+  ( ClashMode,
+    Config (..),
+    DelayHistory (..),
+    GroupDetails (..),
+    Proxy,
+    ProxyShape (..),
+    VersionInfo (..),
+    clashModeText,
+    isGroupProxy,
+    isSelectorProxy,
+    isUrlTestProxy,
+    proxyCurrent,
+    proxyHistory,
+    proxyName,
+    proxyShape,
+    proxyTypeLabel,
+    proxyUdp,
+  )
+import Data.Aeson (ToJSON (..), Value, encode, object, (.=))
 import Data.Bits (rotateR, shiftR, xor)
-import Data.Aeson (ToJSON (..), object, (.=))
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy.Char8 as BL8
+import Data.Foldable (traverse_)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -29,9 +46,11 @@ import Data.Ord (Down (..))
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.Encoding as TE
+import qualified Data.Text.IO as TIO
 import Data.Time (UTCTime)
 import Data.Time.Format (defaultTimeLocale, formatTime)
 import Data.Word (Word32)
+import System.IO (stderr)
 
 data BackgroundTone
   = BackgroundDark
@@ -63,8 +82,8 @@ instance ToJSON DelayStatus where
         ]
 
 data TestResult
-  = ProxyDelay ProxyInfo DelayStatus
-  | GroupDelay ProxyInfo [(Text, DelayStatus)]
+  = ProxyDelay Proxy DelayStatus
+  | GroupDelay Proxy [(Text, DelayStatus)]
   deriving (Eq, Show)
 
 instance ToJSON TestResult where
@@ -85,7 +104,94 @@ instance ToJSON TestResult where
               delays
         ]
 
-renderVersion :: Text -> Maybe VersionResponse -> Text
+data CommandDiagnosticVisibility
+  = DiagnosticAlways
+  | DiagnosticHumanOnly
+  deriving (Eq, Show)
+
+data CommandDiagnostic = CommandDiagnostic
+  { diagnosticVisibility :: CommandDiagnosticVisibility,
+    diagnosticText :: Text
+  }
+  deriving (Eq, Show)
+
+data CommandOutput
+  = CommandOutputVersion Text (Maybe VersionInfo)
+  | CommandOutputMode Config
+  | CommandOutputSwitch Config
+  | CommandOutputList ListOptions [Proxy]
+  | CommandOutputShow (Map Text Proxy) [Proxy]
+  | CommandOutputTest [TestResult] [Text]
+  | CommandOutputSelect Text Text
+  deriving (Eq, Show)
+
+emitCommandOutput :: OutputMode -> RenderStyle -> [CommandDiagnostic] -> CommandOutput -> IO ()
+emitCommandOutput outputMode renderStyle diagnostics commandOutput = do
+  traverse_ emitDiagnostic (filter (diagnosticVisible outputMode) diagnostics)
+  case outputMode of
+    OutputHuman ->
+      traverse_ emitText (renderCommandHuman renderStyle commandOutput)
+    OutputJson ->
+      emitJson (renderCommandJson commandOutput)
+
+diagnosticVisible :: OutputMode -> CommandDiagnostic -> Bool
+diagnosticVisible outputMode diagnostic =
+  case diagnosticVisibility diagnostic of
+    DiagnosticAlways -> True
+    DiagnosticHumanOnly -> outputMode == OutputHuman
+
+emitDiagnostic :: CommandDiagnostic -> IO ()
+emitDiagnostic = TIO.hPutStrLn stderr . diagnosticText
+
+renderCommandHuman :: RenderStyle -> CommandOutput -> Maybe Text
+renderCommandHuman renderStyle = \case
+  CommandOutputVersion localVersion maybeVersionInfo ->
+    Just (renderVersion localVersion maybeVersionInfo)
+  CommandOutputMode config ->
+    Just (renderMode config)
+  CommandOutputSwitch config ->
+    Just (renderSwitch config)
+  CommandOutputList listOptions proxies ->
+    Just (renderList renderStyle listOptions proxies)
+  CommandOutputShow proxyIndex proxies ->
+    Just (renderProxyDetails renderStyle proxyIndex proxies)
+  CommandOutputTest results _
+    | null results -> Nothing
+    | otherwise -> Just (renderTestResults renderStyle results)
+  CommandOutputSelect selectorName optionName ->
+    Just (renderSelect selectorName optionName)
+
+renderCommandJson :: CommandOutput -> Value
+renderCommandJson = \case
+  CommandOutputVersion localVersion maybeVersionInfo ->
+    case maybeVersionInfo of
+      Nothing ->
+        object ["boxctlVersion" .= localVersion]
+      Just versionInfo ->
+        object
+          [ "boxctlVersion" .= localVersion,
+            "server" .= versionInfo
+          ]
+  CommandOutputMode config ->
+    toJSON config
+  CommandOutputSwitch config ->
+    toJSON config
+  CommandOutputList _ proxies ->
+    object ["proxies" .= proxies]
+  CommandOutputShow _ proxies ->
+    object ["proxies" .= proxies]
+  CommandOutputTest results errors ->
+    object
+      [ "results" .= results,
+        "errors" .= errors
+      ]
+  CommandOutputSelect selectorName optionName ->
+    object
+      [ "selector" .= selectorName,
+        "selected" .= optionName
+      ]
+
+renderVersion :: Text -> Maybe VersionInfo -> Text
 renderVersion localVersion maybeVersionInfo =
   case maybeVersionInfo of
     Nothing ->
@@ -94,23 +200,23 @@ renderVersion localVersion maybeVersionInfo =
       T.intercalate
         "  "
         [ "boxctl " <> localVersion,
-          "server=" <> renderVersionLabel versionInfo
+          "server " <> renderVersionLabel versionInfo
         ]
 
-renderMode :: ConfigResponse -> Text
+renderMode :: Config -> Text
 renderMode config =
   T.intercalate
     "  "
     (["mode: " <> clashModeText (configMode config)] <> availableModeLines config)
 
-renderSwitch :: ConfigResponse -> Text
+renderSwitch :: Config -> Text
 renderSwitch config = "mode: " <> clashModeText (configMode config)
 
 renderSelect :: Text -> Text -> Text
 renderSelect selectorName optionName =
   selectorName <> ": " <> optionName
 
-renderList :: RenderStyle -> ListOptions -> [ProxyInfo] -> Text
+renderList :: RenderStyle -> ListOptions -> [Proxy] -> Text
 renderList renderStyle listOptions proxies =
   T.intercalate "\n\n" (catMaybes [groupsSection, nodesSection, hiddenNodesNote])
   where
@@ -142,16 +248,17 @@ renderList renderStyle listOptions proxies =
                 <> " node outbounds hidden; run: boxctl list --all"
             )
 
-renderProxyDetails :: RenderStyle -> Map Text ProxyInfo -> [ProxyInfo] -> Text
+renderProxyDetails :: RenderStyle -> Map Text Proxy -> [Proxy] -> Text
 renderProxyDetails renderStyle proxyIndex proxies =
   T.intercalate "\n\n" (map renderProxy (sortOn proxyDetailSortKey proxies))
   where
-    renderProxy proxy
-      | isGroupProxy proxy = renderGroupDetails renderStyle proxyIndex proxy
-      | otherwise = renderLeafDetails renderStyle proxy
+    renderProxy proxy =
+      case proxyShape proxy of
+        ProxyLeaf _ -> renderLeafDetails renderStyle proxy
+        ProxyGroup _ details -> renderGroupDetails renderStyle proxyIndex proxy details
 
-renderGroupDetails :: RenderStyle -> Map Text ProxyInfo -> ProxyInfo -> Text
-renderGroupDetails renderStyle proxyIndex proxy =
+renderGroupDetails :: RenderStyle -> Map Text Proxy -> Proxy -> GroupDetails -> Text
+renderGroupDetails renderStyle proxyIndex proxy details =
   T.unlines $
     headerLines
       <> detailsLines
@@ -163,17 +270,17 @@ renderGroupDetails renderStyle proxyIndex proxy =
       [ proxyName proxy <> "  " <> renderTypeText renderStyle (proxyTypeLabel proxy)
       ]
     detailsLines =
-      [ "current: " <> fromMaybe "-" (proxyCurrent proxy),
+      [ "current: " <> fromMaybe "-" (groupCurrent details),
         "options: " <> T.pack (show (length members))
       ]
         <> maybe [] (\history -> ["last: " <> historySummary renderStyle history]) (latestHistory proxy)
-    members = proxyMembers proxy
+    members = groupMembers details
     memberLines =
       if null members
         then ["  none"]
-        else renderMemberRows renderStyle proxyIndex (proxyCurrent proxy) members
+        else renderMemberRows renderStyle proxyIndex (groupCurrent details) members
 
-renderLeafDetails :: RenderStyle -> ProxyInfo -> Text
+renderLeafDetails :: RenderStyle -> Proxy -> Text
 renderLeafDetails renderStyle proxy =
   T.intercalate
     "  "
@@ -209,13 +316,13 @@ renderDelayStatus renderStyle = \case
   DelayOk delayMs -> renderDelayMs renderStyle delayMs
   DelayUnavailable reason -> reason
 
-renderVersionLabel :: VersionResponse -> Text
+renderVersionLabel :: VersionInfo -> Text
 renderVersionLabel versionInfo =
   case versionFlags of
     [] -> versionText versionInfo
     flags ->
       versionText versionInfo
-        <> " ("
+        <> " (reported "
         <> T.intercalate ", " flags
         <> ")"
   where
@@ -225,7 +332,7 @@ renderVersionLabel versionInfo =
         <> [ "meta" | versionMeta versionInfo
            ]
 
-availableModeLines :: ConfigResponse -> [Text]
+availableModeLines :: Config -> [Text]
 availableModeLines config =
   case dedupeModes (configModeList config) of
     [] -> []
@@ -234,13 +341,13 @@ availableModeLines config =
     modes -> ["available=" <> T.intercalate ", " (map clashModeText modes)]
 
 dedupeModes :: [ClashMode] -> [ClashMode]
-dedupeModes = foldl insertMode []
+dedupeModes = foldl' insertMode []
   where
     insertMode acc mode
       | mode `elem` acc = acc
       | otherwise = acc <> [mode]
 
-renderGroupRows :: RenderStyle -> [ProxyInfo] -> [Text]
+renderGroupRows :: RenderStyle -> [Proxy] -> [Text]
 renderGroupRows renderStyle proxies =
   map renderRow proxies
   where
@@ -253,7 +360,7 @@ renderGroupRows renderStyle proxies =
         <> "  "
         <> T.intercalate "  " (groupSummaryParts renderStyle proxy)
 
-renderNodeRows :: RenderStyle -> [ProxyInfo] -> [Text]
+renderNodeRows :: RenderStyle -> [Proxy] -> [Text]
 renderNodeRows renderStyle proxies =
   map renderRow proxies
   where
@@ -266,7 +373,7 @@ renderNodeRows renderStyle proxies =
         <> "  "
         <> nodeSummary renderStyle proxy
 
-renderMemberRows :: RenderStyle -> Map Text ProxyInfo -> Maybe Text -> [Text] -> [Text]
+renderMemberRows :: RenderStyle -> Map Text Proxy -> Maybe Text -> [Text] -> [Text]
 renderMemberRows renderStyle proxyIndex current members =
   map renderRow memberProxies
   where
@@ -292,7 +399,7 @@ renderMemberRows renderStyle proxyIndex current members =
         <> "  "
         <> maybe "unknown" (memberSummary renderStyle) maybeProxy
 
-memberSortKey :: Maybe Text -> Map Text ProxyInfo -> Text -> (Int, Int, Text)
+memberSortKey :: Maybe Text -> Map Text Proxy -> Text -> (Int, Int, Text)
 memberSortKey current proxyIndex memberName =
   ( currentRank current memberName,
     maybe maxBound historyDelay (Map.lookup memberName proxyIndex >>= latestHistory),
@@ -329,34 +436,37 @@ testResultSortKey = \case
   GroupDelay proxy _ -> (0, proxyNameKey proxy)
   ProxyDelay proxy _ -> (1, proxyNameKey proxy)
 
-proxyDetailSortKey :: ProxyInfo -> (Int, Text, Text)
+proxyDetailSortKey :: Proxy -> (Int, Text, Text)
 proxyDetailSortKey proxy =
   ( groupKindRank proxy,
     proxyNameKey proxy,
     proxyTypeLabel proxy
   )
 
-groupSortKey :: ProxyInfo -> (Int, Text)
+groupSortKey :: Proxy -> (Int, Text)
 groupSortKey proxy =
   ( groupKindRank proxy,
     proxyNameKey proxy
   )
 
-groupKindRank :: ProxyInfo -> Int
+groupKindRank :: Proxy -> Int
 groupKindRank proxy
   | isSelectorProxy proxy = 0
   | isUrlTestProxy proxy = 1
   | otherwise = 2
 
-groupSummaryParts :: RenderStyle -> ProxyInfo -> [Text]
+groupSummaryParts :: RenderStyle -> Proxy -> [Text]
 groupSummaryParts renderStyle proxy =
-  catMaybes
-    [ fmap ("current=" <>) (proxyCurrent proxy),
-      Just (T.pack (show (length (proxyMembers proxy))) <> " options"),
-      fmap (\history -> "last=" <> renderDelayMs renderStyle (historyDelay history)) (latestHistory proxy)
-    ]
+  case proxyShape proxy of
+    ProxyLeaf _ -> []
+    ProxyGroup _ details ->
+      catMaybes
+        [ fmap ("current=" <>) (groupCurrent details),
+          Just (T.pack (show (length (groupMembers details))) <> " options"),
+          fmap (\history -> "last=" <> renderDelayMs renderStyle (historyDelay history)) (latestHistory proxy)
+        ]
 
-nodeSummary :: RenderStyle -> ProxyInfo -> Text
+nodeSummary :: RenderStyle -> Proxy -> Text
 nodeSummary renderStyle proxy =
   T.intercalate
     "  "
@@ -365,7 +475,7 @@ nodeSummary renderStyle proxy =
         <> ["udp=no" | not (proxyUdp proxy)]
     )
 
-memberSummary :: RenderStyle -> ProxyInfo -> Text
+memberSummary :: RenderStyle -> Proxy -> Text
 memberSummary renderStyle proxy =
   T.intercalate
     "  "
@@ -374,7 +484,7 @@ memberSummary renderStyle proxy =
         <> maybe [] (\history -> [formatTimestamp (historyTime history)]) (latestHistory proxy)
     )
 
-latestHistory :: ProxyInfo -> Maybe DelayHistory
+latestHistory :: Proxy -> Maybe DelayHistory
 latestHistory proxy =
   listToMaybe (sortOn (Down . historyTime) (proxyHistory proxy))
 
@@ -392,13 +502,7 @@ renderSection :: Text -> [Text] -> Text
 renderSection title rows =
   T.intercalate "\n" (title : map ("  " <>) rows)
 
-proxyTypeLabel :: ProxyInfo -> Text
-proxyTypeLabel proxy
-  | isUrlTestProxy proxy = "url-test"
-  | isSelectorProxy proxy = "selector"
-  | otherwise = proxyKindText (proxyKind proxy)
-
-proxyNameKey :: ProxyInfo -> Text
+proxyNameKey :: Proxy -> Text
 proxyNameKey = T.toCaseFold . proxyName
 
 currentMarker :: Maybe Text -> Text -> Text
@@ -433,8 +537,8 @@ renderTypeCell renderStyle width typeLabel =
   colorizeType renderStyle typeLabel (pad width typeLabel)
 
 renderTypeText :: RenderStyle -> Text -> Text
-renderTypeText renderStyle typeLabel
-  = colorizeType renderStyle typeLabel typeLabel
+renderTypeText renderStyle typeLabel =
+  colorizeType renderStyle typeLabel typeLabel
 
 colorizeType :: RenderStyle -> Text -> Text -> Text
 colorizeType renderStyle colorKey renderedText
@@ -469,6 +573,12 @@ ansiForeground red green blue text =
 
 decimal :: Int -> Text
 decimal = T.pack . show
+
+emitJson :: Value -> IO ()
+emitJson = BL8.putStrLn . encode
+
+emitText :: Text -> IO ()
+emitText = TIO.putStrLn . T.dropWhileEnd (== '\n')
 
 data Rgb = Rgb !Int !Int !Int
 

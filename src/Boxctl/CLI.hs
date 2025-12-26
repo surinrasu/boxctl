@@ -14,13 +14,14 @@ module Boxctl.CLI
   )
 where
 
-import Boxctl.API (ClashMode, clashModeFromText)
+import Boxctl.Domain (KnownClashMode, knownClashModeFromText)
+import Boxctl.Instance (InstanceTarget, guessInstanceTarget, instanceAddressTarget, instanceConfigTarget)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Options.Applicative
 
 data Options = Options
-  { optInstance :: Maybe FilePath,
+  { optInstanceTarget :: Maybe InstanceTarget,
     optVerbose :: Bool,
     optOutputMode :: OutputMode,
     optColorMode :: ColorMode,
@@ -42,7 +43,7 @@ data ColorMode
 data Command
   = CmdVersion
   | CmdMode
-  | CmdSwitch ClashMode
+  | CmdSwitch KnownClashMode
   | CmdList ListOptions
   | CmdShow ProxySelection
   | CmdTest ProxySelection
@@ -103,14 +104,39 @@ optionsParser =
       )
     <*> commandParser
 
-instanceOption :: Parser String
+instanceOption :: Parser InstanceTarget
 instanceOption =
-  strOption
-    ( long "instance"
-        <> short 'i'
-        <> metavar "<<PATH>|<ADDR[:<PORT>]>>"
-        <> help "Target instance (defaults to 127.0.0.1:9090)"
-    )
+  guessedInstanceOption
+    <|> configInstanceOption
+    <|> addressInstanceOption
+
+guessedInstanceOption :: Parser InstanceTarget
+guessedInstanceOption =
+  guessInstanceTarget
+    <$> strOption
+      ( long "instance"
+          <> short 'i'
+          <> metavar "<<PATH>|<ADDR[:<PORT>]>>"
+          <> help "Target instance (config path or controller address, defaults to 127.0.0.1:9090)"
+      )
+
+configInstanceOption :: Parser InstanceTarget
+configInstanceOption =
+  instanceConfigTarget
+    <$> strOption
+      ( long "instance-config"
+          <> metavar "PATH"
+          <> help "Target instance config file"
+      )
+
+addressInstanceOption :: Parser InstanceTarget
+addressInstanceOption =
+  instanceAddressTarget
+    <$> strOption
+      ( long "instance-address"
+          <> metavar "ADDR[:<PORT>]"
+          <> help "Target controller address"
+      )
 
 commandParser :: Parser Command
 commandParser =
@@ -197,9 +223,12 @@ colorModeReader =
       "never" -> Right ColorNever
       _ -> Left "expected one of: auto, always, never"
 
-clashModeReader :: ReadM ClashMode
+clashModeReader :: ReadM KnownClashMode
 clashModeReader =
-  eitherReader (Right . clashModeFromText . T.pack)
+  eitherReader $ \rawValue ->
+    case knownClashModeFromText (T.pack rawValue) of
+      Just mode -> Right mode
+      Nothing -> Left "expected one of: rule, global, direct, script"
 
 textArgument :: String -> String -> Parser Text
 textArgument name description =

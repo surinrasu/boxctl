@@ -7,140 +7,163 @@ where
 
 import Boxctl.API
 import Boxctl.CLI
+import Boxctl.Domain
+  ( Config (..),
+    GroupDetails (..),
+    Proxy,
+    ProxyShape (..),
+    clashModeMatchesKnown,
+    knownClashModeText,
+    isSelectorProxy,
+    isUrlTestProxy,
+    proxyName,
+    proxyShape,
+  )
 import Boxctl.Error
 import Boxctl.Instance (resolveInstance)
 import Boxctl.Output
+  ( CommandDiagnostic (..),
+    CommandDiagnosticVisibility (..),
+    CommandOutput (..),
+    DelayStatus (..),
+    TestResult (..),
+    emitCommandOutput,
+  )
 import Boxctl.Terminal (resolveRenderStyle)
 import Control.Concurrent.Async (mapConcurrently)
-import Control.Monad (unless, when)
+import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE, withExceptT)
-import Data.Aeson (Value, encode, object, toJSON, (.=))
-import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Either (partitionEithers)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Paths_boxctl (version)
-import System.IO (stderr)
+
+data CommandReport = CommandReport
+  { reportOutput :: CommandOutput,
+    reportDiagnostics :: [CommandDiagnostic],
+    reportFailure :: Maybe CommandError
+  }
 
 run :: Options -> ExceptT BoxctlError IO ()
-run options =
+run options = do
+  report <- executeCommand options
+  renderStyle <- liftIO (resolveRenderStyle options)
+  liftIO $
+    emitCommandOutput
+      (optOutputMode options)
+      renderStyle
+      (reportDiagnostics report)
+      (reportOutput report)
+  case reportFailure report of
+    Nothing -> pure ()
+    Just commandError -> throwE (BoxctlCommandError commandError)
+
+executeCommand :: Options -> ExceptT BoxctlError IO CommandReport
+executeCommand options =
   case optCommand options of
     CmdVersion ->
       runVersionCommand options
     command -> do
-      renderStyle <- liftIO (resolveRenderStyle options)
       controller <- resolveController options
-      runCommand renderStyle (optOutputMode options) controller command
+      runControllerCommand controller command
 
 resolveController :: Options -> ExceptT BoxctlError IO Controller
 resolveController options = do
-  resolvedInstance <- withExceptT BoxctlInstanceError (resolveInstance (optInstance options))
+  resolvedInstance <- withExceptT BoxctlInstanceError (resolveInstance (optInstanceTarget options))
   liftIO (mkController resolvedInstance (optVerbose options))
 
-runVersionCommand :: Options -> ExceptT BoxctlError IO ()
+runVersionCommand :: Options -> ExceptT BoxctlError IO CommandReport
 runVersionCommand options = do
   let localVersion = T.pack (showVersion version)
-  controller <- resolveController options
   serverVersionResult <-
     liftIO $
       runExceptT $
-        withExceptT BoxctlApiError (fetchVersion controller)
-  case serverVersionResult of
-    Right versionInfo -> do
-      liftIO $
-        emitOutput
-        (optOutputMode options)
-        (renderVersion localVersion (Just versionInfo))
-        (object ["boxctlVersion" .= localVersion, "server" .= versionInfo])
-    Left err -> do
-      when (optVerbose options) $
-        liftIO $
-          TIO.hPutStrLn stderr ("boxctl: server version unavailable: " <> renderBoxctlError err)
-      liftIO $
-        emitOutput
-        (optOutputMode options)
-        (renderVersion localVersion Nothing)
-        (object ["boxctlVersion" .= localVersion])
+        do
+          controller <- resolveController options
+          withExceptT BoxctlApiError (fetchVersion controller)
+  pure $
+    case serverVersionResult of
+      Right versionInfo ->
+        successReport (CommandOutputVersion localVersion (Just versionInfo))
+      Left err ->
+        CommandReport
+          { reportOutput = CommandOutputVersion localVersion Nothing,
+            reportDiagnostics =
+              [ CommandDiagnostic
+                  { diagnosticVisibility = DiagnosticAlways,
+                    diagnosticText = "boxctl: server version unavailable: " <> renderBoxctlError err
+                  }
+              | optVerbose options
+              ],
+            reportFailure = Nothing
+          }
 
-runCommand :: RenderStyle -> OutputMode -> Controller -> Command -> ExceptT BoxctlError IO ()
-runCommand renderStyle outputMode controller command =
+runControllerCommand :: Controller -> Command -> ExceptT BoxctlError IO CommandReport
+runControllerCommand controller command =
   case command of
     CmdVersion ->
-      pure ()
+      pure (successReport (CommandOutputVersion (T.pack (showVersion version)) Nothing))
     CmdMode -> do
       config <- withExceptT BoxctlApiError (fetchConfigs controller)
-      liftIO $
-        emitOutput outputMode (renderMode config) (toJSON config)
+      pure (successReport (CommandOutputMode config))
     CmdSwitch newMode -> do
       supported <- withExceptT BoxctlApiError (fetchConfigs controller)
-      unless (null (configModeList supported) || newMode `elem` configModeList supported) $
-        throwE (BoxctlCommandError (UnsupportedMode (clashModeText newMode)))
+      unless (null (configModeList supported) || any (clashModeMatchesKnown newMode) (configModeList supported)) $
+        throwE (BoxctlCommandError (UnsupportedMode (knownClashModeText newMode)))
       withExceptT BoxctlApiError (switchMode controller newMode)
       config <- withExceptT BoxctlApiError (fetchConfigs controller)
-      liftIO $
-        emitOutput outputMode (renderSwitch config) (toJSON config)
+      pure (successReport (CommandOutputSwitch config))
     CmdList listOptions -> do
       proxies <- withExceptT BoxctlApiError (fetchProxies controller)
-      liftIO $
-        emitOutput
-          outputMode
-          (renderList renderStyle listOptions proxies)
-          (object ["proxies" .= proxies])
+      pure (successReport (CommandOutputList listOptions proxies))
     CmdShow selection -> do
       allProxies <- withExceptT BoxctlApiError (fetchProxies controller)
       proxies <- exceptCommand (selectProxiesFrom selection allProxies)
-      liftIO $
-        emitOutput
-          outputMode
-          (renderProxyDetails renderStyle (proxyIndex allProxies) proxies)
-          (object ["proxies" .= proxies])
+      pure (successReport (CommandOutputShow (proxyIndex allProxies) proxies))
     CmdTest selection -> do
       allProxies <- withExceptT BoxctlApiError (fetchProxies controller)
       proxies <- exceptCommand (selectProxiesFrom selection allProxies)
       tested <- liftIO (mapConcurrently (runExceptT . testProxy controller) proxies)
       let (errs, results) = partitionEithers tested
           renderedErrors = map renderBoxctlError errs
-          payload = object ["results" .= results, "errors" .= renderedErrors]
-      case outputMode of
-        OutputHuman ->
-          liftIO (mapM_ (TIO.hPutStrLn stderr) renderedErrors)
-        OutputJson ->
-          pure ()
-      if null results
-        then do
-          case outputMode of
-            OutputJson -> liftIO (emitJson payload)
-            OutputHuman -> pure ()
-          throwE (BoxctlCommandError NoDelayResults)
-        else do
-          liftIO (emitOutput outputMode (renderTestResults renderStyle results) payload)
-          unless (null errs) $
-            throwE (BoxctlCommandError DelayTestsFailed)
+          diagnostics =
+            map
+              (\message -> CommandDiagnostic {diagnosticVisibility = DiagnosticHumanOnly, diagnosticText = message})
+              renderedErrors
+          failure
+            | null results = Just NoDelayResults
+            | null errs = Nothing
+            | otherwise = Just DelayTestsFailed
+      pure
+        CommandReport
+          { reportOutput = CommandOutputTest results renderedErrors,
+            reportDiagnostics = diagnostics,
+            reportFailure = failure
+          }
     CmdSelect selectCommand -> do
       proxies <- withExceptT BoxctlApiError (fetchProxies controller)
       (selectorProxy, selectorOption) <- exceptCommand (resolveSelector proxies selectCommand)
       withExceptT BoxctlApiError (selectProxyOption controller (proxyName selectorProxy) selectorOption)
-      liftIO $
-        emitOutput
-          outputMode
-          (renderSelect (proxyName selectorProxy) selectorOption)
-          ( object
-              [ "selector" .= proxyName selectorProxy,
-                "selected" .= selectorOption
-              ]
-          )
+      pure (successReport (CommandOutputSelect (proxyName selectorProxy) selectorOption))
+
+successReport :: CommandOutput -> CommandReport
+successReport output =
+  CommandReport
+    { reportOutput = output,
+      reportDiagnostics = [],
+      reportFailure = Nothing
+    }
 
 exceptCommand :: Either CommandError a -> ExceptT BoxctlError IO a
 exceptCommand =
   either (throwE . BoxctlCommandError) pure
 
-selectProxiesFrom :: ProxySelection -> [ProxyInfo] -> Either CommandError [ProxyInfo]
+selectProxiesFrom :: ProxySelection -> [Proxy] -> Either CommandError [Proxy]
 selectProxiesFrom selection allProxies =
   if null requestedNames
     then
@@ -164,7 +187,7 @@ selectProxiesFrom selection allProxies =
       | filterMatches (selectionFilter selection) proxy = Right proxy
       | otherwise = Left (OutboundDoesNotMatchFilter (proxyName proxy))
 
-resolveSelector :: [ProxyInfo] -> SelectCommand -> Either CommandError (ProxyInfo, Text)
+resolveSelector :: [Proxy] -> SelectCommand -> Either CommandError (Proxy, Text)
 resolveSelector proxies selectCommand = do
   let selectors = filter isSelectorProxy proxies
   selectorProxy <-
@@ -185,35 +208,42 @@ resolveSelector proxies selectCommand = do
         SelectByOption singleOption -> singleOption
         SelectBySelector _ namedOption -> namedOption
 
-testProxy :: Controller -> ProxyInfo -> ExceptT BoxctlError IO TestResult
-testProxy controller proxy
-  | isGroupProxy proxy = do
-      groupDelayResult <- liftIO (runExceptT (fetchGroupDelay controller (proxyName proxy) 15000))
-      case groupDelayResult of
-        Right delays ->
-          pure (GroupDelay proxy (materializeGroupDelays proxy delays))
-        Left apiErr
-          | Just label <- apiDelayFailureLabel apiErr ->
-              pure (GroupDelay proxy (materializeGroupError proxy label))
-          | otherwise ->
-              throwE (BoxctlCommandError (DelayProbeFailed (proxyName proxy) apiErr))
-  | otherwise = do
-      delayResult <- liftIO (runExceptT (fetchProxyDelay controller (proxyName proxy) 15000))
-      case delayResult of
-        Right delay ->
-          pure (ProxyDelay proxy (DelayOk (delayValue delay)))
-        Left apiErr
-          | Just label <- apiDelayFailureLabel apiErr ->
-              pure (ProxyDelay proxy (DelayUnavailable label))
-          | otherwise ->
-              throwE (BoxctlCommandError (DelayProbeFailed (proxyName proxy) apiErr))
+testProxy :: Controller -> Proxy -> ExceptT BoxctlError IO TestResult
+testProxy controller proxy =
+  case proxyShape proxy of
+    ProxyLeaf _ -> testLeafProxy controller proxy
+    ProxyGroup _ details -> testGroupProxy controller proxy details
 
-materializeGroupDelays :: ProxyInfo -> Map Text Int -> [(Text, DelayStatus)]
-materializeGroupDelays proxy measured =
+testLeafProxy :: Controller -> Proxy -> ExceptT BoxctlError IO TestResult
+testLeafProxy controller proxy = do
+  delayResult <- liftIO (runExceptT (fetchProxyDelay controller (proxyName proxy) 15000))
+  case delayResult of
+    Right delayMs ->
+      pure (ProxyDelay proxy (DelayOk delayMs))
+    Left apiErr
+      | Just label <- apiDelayFailureLabel apiErr ->
+          pure (ProxyDelay proxy (DelayUnavailable label))
+      | otherwise ->
+          throwE (BoxctlCommandError (DelayProbeFailed (proxyName proxy) apiErr))
+
+testGroupProxy :: Controller -> Proxy -> GroupDetails -> ExceptT BoxctlError IO TestResult
+testGroupProxy controller proxy details = do
+  groupDelayResult <- liftIO (runExceptT (fetchGroupDelay controller (proxyName proxy) 15000))
+  case groupDelayResult of
+    Right delays ->
+      pure (GroupDelay proxy (materializeGroupDelays details delays))
+    Left apiErr
+      | Just label <- apiDelayFailureLabel apiErr ->
+          pure (GroupDelay proxy (materializeGroupError details label))
+      | otherwise ->
+          throwE (BoxctlCommandError (DelayProbeFailed (proxyName proxy) apiErr))
+
+materializeGroupDelays :: GroupDetails -> Map Text Int -> [(Text, DelayStatus)]
+materializeGroupDelays details measured =
   map renderMember orderedMembers
   where
     orderedMembers =
-      case proxyMembers proxy of
+      case groupMembers details of
         [] -> Map.keys measured
         members -> members
     renderMember memberName =
@@ -221,13 +251,11 @@ materializeGroupDelays proxy measured =
         Just delayMs -> (memberName, DelayOk delayMs)
         Nothing -> (memberName, DelayUnavailable "unavailable")
 
-materializeGroupError :: ProxyInfo -> Text -> [(Text, DelayStatus)]
-materializeGroupError proxy label =
-  map (\memberName -> (memberName, DelayUnavailable label)) orderedMembers
-  where
-    orderedMembers = proxyMembers proxy
+materializeGroupError :: GroupDetails -> Text -> [(Text, DelayStatus)]
+materializeGroupError details label =
+  map (\memberName -> (memberName, DelayUnavailable label)) (groupMembers details)
 
-proxyIndex :: [ProxyInfo] -> Map Text ProxyInfo
+proxyIndex :: [Proxy] -> Map Text Proxy
 proxyIndex proxies =
   Map.fromList [(proxyName proxy, proxy) | proxy <- proxies]
 
@@ -247,7 +275,7 @@ findByName getName values requestedName =
         [value] -> UniqueName value
         matches -> AmbiguousName matches
 
-resolveProxyByName :: [ProxyInfo] -> Text -> Either CommandError ProxyInfo
+resolveProxyByName :: [Proxy] -> Text -> Either CommandError Proxy
 resolveProxyByName proxies requestedName =
   case findByName proxyName proxies requestedName of
     MissingName ->
@@ -257,7 +285,7 @@ resolveProxyByName proxies requestedName =
     AmbiguousName matches ->
       Left (AmbiguousOutbound requestedName (map proxyName matches))
 
-resolveSelectorByName :: [ProxyInfo] -> Text -> Either CommandError ProxyInfo
+resolveSelectorByName :: [Proxy] -> Text -> Either CommandError Proxy
 resolveSelectorByName selectors requestedName =
   case findByName proxyName selectors requestedName of
     MissingName ->
@@ -267,34 +295,24 @@ resolveSelectorByName selectors requestedName =
     AmbiguousName matches ->
       Left (AmbiguousSelector requestedName (map proxyName matches))
 
-resolveSelectorOption :: ProxyInfo -> Text -> Either CommandError Text
+resolveSelectorOption :: Proxy -> Text -> Either CommandError Text
 resolveSelectorOption selectorProxy requestedOption =
-  case findByName id members requestedOption of
-    MissingName ->
+  case proxyShape selectorProxy of
+    ProxyLeaf _ ->
       Left (OptionNotFound (proxyName selectorProxy) requestedOption)
-    UniqueName selectedOption ->
-      Right selectedOption
-    AmbiguousName matches ->
-      Left (AmbiguousOption (proxyName selectorProxy) requestedOption matches)
-  where
-    members = proxyMembers selectorProxy
+    ProxyGroup _ details ->
+      case findByName id (groupMembers details) requestedOption of
+        MissingName ->
+          Left (OptionNotFound (proxyName selectorProxy) requestedOption)
+        UniqueName selectedOption ->
+          Right selectedOption
+        AmbiguousName matches ->
+          Left (AmbiguousOption (proxyName selectorProxy) requestedOption matches)
 
-filterMatches :: ProxyFilter -> ProxyInfo -> Bool
+filterMatches :: ProxyFilter -> Proxy -> Bool
 filterMatches FilterAll _ = True
 filterMatches FilterSelectors proxy = isSelectorProxy proxy
 filterMatches FilterUrlTests proxy = isUrlTestProxy proxy
 
 textEqualsFold :: Text -> Text -> Bool
 textEqualsFold left right = T.toCaseFold left == T.toCaseFold right
-
-emitOutput :: OutputMode -> Text -> Value -> IO ()
-emitOutput outputMode humanOutput jsonOutput =
-  case outputMode of
-    OutputHuman -> emit humanOutput
-    OutputJson -> emitJson jsonOutput
-
-emitJson :: Value -> IO ()
-emitJson = BL8.putStrLn . encode
-
-emit :: Text -> IO ()
-emit = TIO.putStrLn . T.dropWhileEnd (== '\n')
