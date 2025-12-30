@@ -10,6 +10,7 @@ module Boxctl.Instance
     instanceConfigTarget,
     normalizeControllerAddress,
     resolveInstance,
+    resolveSsmInstance,
     stripJsonComments,
   )
 where
@@ -18,12 +19,14 @@ import Boxctl.Error (InstanceError (..))
 import Control.Applicative ((<|>))
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT (..))
-import Data.Aeson ((.:?))
+import Data.Aeson ((.:), (.:?), (.!=))
 import qualified Data.Aeson as Aeson
 import Data.Bifunctor (first)
 import qualified Data.ByteString as BS
 import Data.Char (isDigit, toLower)
 import Data.List (isInfixOf)
+import Data.Map.Strict (Map)
+import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -52,8 +55,9 @@ data ResolvedInstance = ResolvedInstance
 defaultControllerAddress :: Text
 defaultControllerAddress = "127.0.0.1:9090"
 
-newtype ConfigFile = ConfigFile
-  { configExperimental :: Maybe ExperimentalBlock
+data ConfigFile = ConfigFile
+  { configExperimental :: Maybe ExperimentalBlock,
+    configServices :: [ServiceBlock]
   }
 
 newtype ExperimentalBlock = ExperimentalBlock
@@ -65,9 +69,29 @@ data ClashAPIBlock = ClashAPIBlock
     clashApiSecret :: Maybe Text
   }
 
+data ServiceBlock = ServiceBlock
+  { serviceType :: Text,
+    serviceTag :: Maybe Text,
+    serviceListen :: Maybe Text,
+    serviceListenPort :: Maybe Int,
+    serviceServers :: Map Text Text,
+    serviceTls :: Maybe ServiceTLSBlock
+  }
+
+newtype ServiceTLSBlock = ServiceTLSBlock
+  { serviceTlsEnabled :: Maybe Bool
+  }
+
+data NameMatch a
+  = MissingName
+  | UniqueName a
+  | AmbiguousName [a]
+
 instance Aeson.FromJSON ConfigFile where
   parseJSON = Aeson.withObject "ConfigFile" $ \obj ->
-    ConfigFile <$> obj .:? "experimental"
+    ConfigFile
+      <$> obj .:? "experimental"
+      <*> (obj .:? "services" .!= [])
 
 instance Aeson.FromJSON ExperimentalBlock where
   parseJSON = Aeson.withObject "ExperimentalBlock" $ \obj ->
@@ -78,6 +102,20 @@ instance Aeson.FromJSON ClashAPIBlock where
     ClashAPIBlock
       <$> obj .:? "external_controller"
       <*> obj .:? "secret"
+
+instance Aeson.FromJSON ServiceBlock where
+  parseJSON = Aeson.withObject "ServiceBlock" $ \obj ->
+    ServiceBlock
+      <$> obj .: "type"
+      <*> obj .:? "tag"
+      <*> obj .:? "listen"
+      <*> obj .:? "listen_port"
+      <*> (obj .:? "servers" .!= Map.empty)
+      <*> obj .:? "tls"
+
+instance Aeson.FromJSON ServiceTLSBlock where
+  parseJSON = Aeson.withObject "ServiceTLSBlock" $ \obj ->
+    ServiceTLSBlock <$> obj .:? "enabled"
 
 guessInstanceTarget :: String -> InstanceTarget
 guessInstanceTarget =
@@ -93,31 +131,63 @@ instanceAddressTarget =
 
 resolveInstance :: Maybe InstanceTarget -> ExceptT InstanceError IO ResolvedInstance
 resolveInstance cliInstance = do
-  envInstance <- liftIO (fmap guessInstanceTarget <$> lookupEnv "BOXCTL_INSTANCE")
-  envSecret <- liftIO (fmap T.pack <$> lookupEnv "BOXCTL_SECRET")
-  let target = fromMaybe (InstanceTargetAddress (ControllerAddress defaultControllerAddress)) (cliInstance <|> envInstance)
-  resolved <- resolveTarget target
+  (target, envSecret) <- resolveTargetSelection cliInstance
+  resolved <- resolveTargetWith resolveClashFromConfig resolveFromAddress target
   pure resolved {resolvedSecret = envSecret <|> resolvedSecret resolved}
 
-resolveTarget :: InstanceTarget -> ExceptT InstanceError IO ResolvedInstance
-resolveTarget = \case
-  InstanceTargetGuess rawTarget -> resolveGuessedTarget rawTarget
-  InstanceTargetConfig configPath -> resolveConfigTarget configPath
-  InstanceTargetAddress controllerAddress -> exceptEither (resolveFromAddress controllerAddress)
+resolveSsmInstance :: Maybe InstanceTarget -> Maybe Text -> Maybe Text -> ExceptT InstanceError IO ResolvedInstance
+resolveSsmInstance cliInstance maybeServiceTag maybeEndpoint = do
+  (target, envSecret) <- resolveTargetSelection cliInstance
+  resolved <-
+    resolveTargetWith
+      (resolveSsmFromConfig maybeServiceTag maybeEndpoint)
+      (resolveSsmFromAddress maybeEndpoint)
+      target
+  pure resolved {resolvedSecret = envSecret <|> resolvedSecret resolved}
 
-resolveConfigTarget :: FilePath -> ExceptT InstanceError IO ResolvedInstance
-resolveConfigTarget configPath = do
+resolveTargetSelection :: Maybe InstanceTarget -> ExceptT InstanceError IO (InstanceTarget, Maybe Text)
+resolveTargetSelection cliInstance = do
+  envInstance <- liftIO (fmap guessInstanceTarget <$> lookupEnv "BOXCTL_INSTANCE")
+  envSecret <- liftIO (fmap T.pack <$> lookupEnv "BOXCTL_SECRET")
+  let target =
+        fromMaybe
+          (InstanceTargetAddress (ControllerAddress defaultControllerAddress))
+          (cliInstance <|> envInstance)
+  pure (target, envSecret)
+
+resolveTargetWith ::
+  (FilePath -> ExceptT InstanceError IO ResolvedInstance) ->
+  (ControllerAddress -> Either InstanceError ResolvedInstance) ->
+  InstanceTarget ->
+  ExceptT InstanceError IO ResolvedInstance
+resolveTargetWith resolveConfig resolveAddress = \case
+  InstanceTargetGuess rawTarget ->
+    resolveGuessedTargetWith resolveConfig resolveAddress rawTarget
+  InstanceTargetConfig configPath ->
+    resolveConfigTargetWith resolveConfig configPath
+  InstanceTargetAddress controllerAddress ->
+    exceptEither (resolveAddress controllerAddress)
+
+resolveConfigTargetWith ::
+  (FilePath -> ExceptT InstanceError IO ResolvedInstance) ->
+  FilePath ->
+  ExceptT InstanceError IO ResolvedInstance
+resolveConfigTargetWith resolveConfig configPath = do
   directoryExists <- liftIO (doesDirectoryExist configPath)
   if directoryExists
     then ExceptT (pure (Left InstancePathIsDirectory))
     else do
       fileExists <- liftIO (doesFileExist configPath)
       if fileExists
-        then resolveFromConfig configPath
+        then resolveConfig configPath
         else ExceptT (pure (Left (InstanceConfigFileNotFound configPath)))
 
-resolveGuessedTarget :: Text -> ExceptT InstanceError IO ResolvedInstance
-resolveGuessedTarget rawTarget = do
+resolveGuessedTargetWith ::
+  (FilePath -> ExceptT InstanceError IO ResolvedInstance) ->
+  (ControllerAddress -> Either InstanceError ResolvedInstance) ->
+  Text ->
+  ExceptT InstanceError IO ResolvedInstance
+resolveGuessedTargetWith resolveConfig resolveAddress rawTarget = do
   let target = T.unpack (T.strip rawTarget)
   directoryExists <- liftIO (doesDirectoryExist target)
   if directoryExists
@@ -125,12 +195,12 @@ resolveGuessedTarget rawTarget = do
     else do
       fileExists <- liftIO (doesFileExist target)
       if fileExists
-        then resolveFromConfig target
+        then resolveConfig target
         else
           exceptEither $
             if looksLikeConfigPath target
               then Left (InstanceConfigFileNotFound target)
-              else resolveFromAddress (ControllerAddress (T.pack target))
+              else resolveAddress (ControllerAddress (T.pack target))
 
 looksLikeConfigPath :: FilePath -> Bool
 looksLikeConfigPath target =
@@ -140,21 +210,135 @@ looksLikeConfigPath target =
            || map toLower (takeExtension target) `elem` [".json", ".jsonc"]
        )
 
-resolveFromConfig :: FilePath -> ExceptT InstanceError IO ResolvedInstance
-resolveFromConfig configPath = do
-  configBytes <- liftIO (BS.readFile configPath)
-  let sanitized = stripJsonComments configBytes
+resolveClashFromConfig :: FilePath -> ExceptT InstanceError IO ResolvedInstance
+resolveClashFromConfig configPath = do
+  config <- readConfigFile configPath
   exceptEither $ do
-    config <- first (InstanceConfigParseError . T.pack) (Aeson.eitherDecodeStrict' sanitized)
     clashApi <- maybe (Left MissingClashApiConfig) Right (configExperimental config >>= experimentalClashApi)
     externalController <- maybe (Left MissingExternalController) Right (clashApiExternalController clashApi)
     normalized <- resolveFromAddress (ControllerAddress externalController)
     Right normalized {resolvedSecret = clashApiSecret clashApi}
 
+resolveSsmFromConfig :: Maybe Text -> Maybe Text -> FilePath -> ExceptT InstanceError IO ResolvedInstance
+resolveSsmFromConfig maybeServiceTag maybeEndpoint configPath = do
+  config <- readConfigFile configPath
+  exceptEither $ do
+    service <- selectSsmService maybeServiceTag (filter isSsmApiService (configServices config))
+    endpoint <- selectSsmEndpoint maybeEndpoint service
+    buildSsmServiceInstance service endpoint
+
+readConfigFile :: FilePath -> ExceptT InstanceError IO ConfigFile
+readConfigFile configPath = do
+  configBytes <- liftIO (BS.readFile configPath)
+  let sanitized = stripJsonComments configBytes
+  exceptEither $
+    first (InstanceConfigParseError . T.pack) (Aeson.eitherDecodeStrict' sanitized)
+
+isSsmApiService :: ServiceBlock -> Bool
+isSsmApiService service =
+  T.toCaseFold (T.strip (serviceType service)) == "ssm-api"
+
+selectSsmService :: Maybe Text -> [ServiceBlock] -> Either InstanceError ServiceBlock
+selectSsmService maybeRequestedTag services =
+  case maybeRequestedTag of
+    Just requestedTag ->
+      case findByMaybeName serviceTag services requestedTag of
+        MissingName ->
+          Left (SsmApiServiceTagNotFound requestedTag)
+        UniqueName service ->
+          Right service
+        AmbiguousName matches ->
+          Left (MultipleSsmApiServices (map ssmServiceLabel matches))
+    Nothing ->
+      case services of
+        [] -> Left MissingSsmApiServices
+        [service] -> Right service
+        many -> Left (MultipleSsmApiServices (map ssmServiceLabel many))
+
+selectSsmEndpoint :: Maybe Text -> ServiceBlock -> Either InstanceError Text
+selectSsmEndpoint maybeRequested service =
+  case maybeRequested of
+    Just requestedEndpoint
+      | Map.member requestedEndpoint endpoints ->
+          Right requestedEndpoint
+      | otherwise ->
+          Left (SsmApiEndpointNotFound requestedEndpoint)
+    Nothing
+      | Map.null endpoints ->
+          Left (MissingSsmApiServiceEndpoints serviceLabel)
+      | Map.member "/" endpoints ->
+          Right "/"
+      | [onlyEndpoint] <- Map.keys endpoints ->
+          Right onlyEndpoint
+      | otherwise ->
+          Left (MultipleSsmApiEndpoints serviceLabel (Map.keys endpoints))
+  where
+    endpoints = serviceServers service
+    serviceLabel = ssmServiceLabel service
+
+buildSsmServiceInstance :: ServiceBlock -> Text -> Either InstanceError ResolvedInstance
+buildSsmServiceInstance service endpoint = do
+  listenAddress <- maybe (Left (MissingSsmApiListen serviceLabel)) Right (serviceListen service)
+  listenPortText <-
+    case serviceListenPort service of
+      Just port
+        | port > 0 && port <= 65535 ->
+            Right (T.pack (show port))
+      _ ->
+        Left (MissingSsmApiListenPort serviceLabel)
+  baseUrl <-
+    buildBaseUrlWithScheme
+      (if serviceUsesTls service then "https" else "http")
+      (normalizeHost False listenAddress)
+      listenPortText
+  Right
+    ResolvedInstance
+      { resolvedBaseUrl = appendSsmApiPath baseUrl (Just endpoint),
+        resolvedSecret = Nothing
+      }
+  where
+    serviceLabel = ssmServiceLabel service
+
+serviceUsesTls :: ServiceBlock -> Bool
+serviceUsesTls service =
+  maybe False (fromMaybe False . serviceTlsEnabled) (serviceTls service)
+
+ssmServiceLabel :: ServiceBlock -> Text
+ssmServiceLabel service =
+  fromMaybe "<untagged>" (serviceTag service)
+
 resolveFromAddress :: ControllerAddress -> Either InstanceError ResolvedInstance
 resolveFromAddress (ControllerAddress rawAddress) = do
   baseUrl <- normalizeControllerAddress rawAddress
   Right ResolvedInstance {resolvedBaseUrl = baseUrl, resolvedSecret = Nothing}
+
+resolveSsmFromAddress :: Maybe Text -> ControllerAddress -> Either InstanceError ResolvedInstance
+resolveSsmFromAddress maybeEndpoint controllerAddress = do
+  resolved <- resolveFromAddress controllerAddress
+  Right
+    resolved
+      { resolvedBaseUrl = appendSsmApiPath (resolvedBaseUrl resolved) maybeEndpoint
+      }
+
+appendSsmApiPath :: Text -> Maybe Text -> Text
+appendSsmApiPath rawBaseUrl maybeEndpoint
+  | Just endpoint <- maybeEndpoint =
+      baseUrl <> normalizeEndpointPrefix endpoint <> "/server/v1"
+  | T.isSuffixOf "/server/v1" baseUrl =
+      baseUrl
+  | otherwise =
+      baseUrl <> "/server/v1"
+  where
+    baseUrl = T.dropWhileEnd (== '/') rawBaseUrl
+
+normalizeEndpointPrefix :: Text -> Text
+normalizeEndpointPrefix rawEndpoint =
+  case T.dropWhileEnd (== '/') (T.strip rawEndpoint) of
+    "" -> ""
+    "/" -> ""
+    trimmed
+      | T.isPrefixOf "/" trimmed -> trimmed
+      | otherwise -> "/" <> trimmed
 
 normalizeControllerAddress :: Text -> Either InstanceError Text
 normalizeControllerAddress rawValue
@@ -169,11 +353,11 @@ normalizeSimpleAddress :: Text -> Either InstanceError Text
 normalizeSimpleAddress rawAddress =
   case T.splitOn ":" rawAddress of
     [host] ->
-      buildBaseUrl (normalizeHost False host) "9090"
+      buildBaseUrlWithScheme "http" (normalizeHost False host) "9090"
     ["", port] ->
-      buildBaseUrl "127.0.0.1" port
+      buildBaseUrlWithScheme "http" "127.0.0.1" port
     [host, port] ->
-      buildBaseUrl (normalizeHost False host) port
+      buildBaseUrlWithScheme "http" (normalizeHost False host) port
     _ ->
       Left (InvalidInstanceAddress "invalid instance address; bracket IPv6 literals like [::1]:9090")
 
@@ -186,18 +370,18 @@ normalizeBracketedAddress rawAddress =
           let portPart = T.drop 1 rest
               host = normalizeHost True rawHost
            in case portPart of
-                "" -> buildBaseUrl host "9090"
+                "" -> buildBaseUrlWithScheme "http" host "9090"
                 p ->
                   case T.stripPrefix ":" p of
-                    Just port -> buildBaseUrl host port
+                    Just port -> buildBaseUrlWithScheme "http" host port
                     Nothing -> Left (InvalidInstanceAddress "invalid bracketed instance address")
 
-buildBaseUrl :: Text -> Text -> Either InstanceError Text
-buildBaseUrl host port
+buildBaseUrlWithScheme :: Text -> Text -> Text -> Either InstanceError Text
+buildBaseUrlWithScheme scheme host port
   | T.null host = Left (InvalidInstanceAddress "instance host is empty")
   | not (validPort port) = Left (InvalidInstanceAddress "instance port must be in the range 1-65535")
-  | needsBrackets host = Right ("http://[" <> host <> "]:" <> port)
-  | otherwise = Right ("http://" <> host <> ":" <> port)
+  | needsBrackets host = Right (scheme <> "://[" <> host <> "]:" <> port)
+  | otherwise = Right (scheme <> "://" <> host <> ":" <> port)
 
 validPort :: Text -> Bool
 validPort port
@@ -210,20 +394,45 @@ validPort port
 
 normalizeHost :: Bool -> Text -> Text
 normalizeHost bracketed rawHost =
-  case T.strip rawHost of
+  case T.strip (stripHostBrackets rawHost) of
     "" -> "127.0.0.1"
     "*" -> loopback
     "0.0.0.0" -> "127.0.0.1"
     "::" -> "::1"
-    "[::]" -> "::1"
     host -> host
   where
     loopback
       | bracketed = "::1"
       | otherwise = "127.0.0.1"
 
+stripHostBrackets :: Text -> Text
+stripHostBrackets host =
+  if T.length trimmed >= 2 && T.head trimmed == '[' && T.last trimmed == ']'
+    then T.init (T.tail trimmed)
+    else trimmed
+  where
+    trimmed = T.strip host
+
 needsBrackets :: Text -> Bool
 needsBrackets host = T.count ":" host > 1
+
+findByMaybeName :: (a -> Maybe Text) -> [a] -> Text -> NameMatch a
+findByMaybeName getName values requestedName =
+  case filter (nameMatchesExactly requestedName) values of
+    value : [] ->
+      UniqueName value
+    [] ->
+      case filter (nameMatchesFold requestedName) values of
+        [] -> MissingName
+        [value] -> UniqueName value
+        matches -> AmbiguousName matches
+    matches ->
+      AmbiguousName matches
+  where
+    nameMatchesExactly requested =
+      maybe False (== requested) . getName
+    nameMatchesFold requested =
+      maybe False ((== T.toCaseFold requested) . T.toCaseFold) . getName
 
 stripJsonComments :: BS.ByteString -> BS.ByteString
 stripJsonComments = BS.pack . goNormal . BS.unpack

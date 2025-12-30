@@ -26,6 +26,20 @@ boxctl [OPTION] <COMMAND>
   - `test [OUTBOUND1] [OUTBOUND2] [...]`    Test delays of outbounds
   - `select <OPTION>`                       Select an option when only one selector exists
   - `select <SELECTOR> <OPTION>`            Select an option for a specific selector
+  - `ssm ...`                               Manage Shadowsocks users via SSM API
+
+#### SSM
+
+```shell
+boxctl ssm [--tag NAME] [--endpoint PATH] <COMMAND>
+```
+
+  - `list`                                  List users
+  - `show <USER1> [USER2] [...]`            Show detailed users' information
+  - `add <USER>`                            Add a user
+  - `remove <USER1> [USER2] [...]`          Remove users
+  - `update <USER>`                         Update a user's password
+  - `stat`                                  Show traffic statistics
 
 ### Env Variables
   - `BOXCTL_INSTANCE`                       Default target

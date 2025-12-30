@@ -10,6 +10,10 @@ module Boxctl.CLI
     ProxyFilter (..),
     ProxySelection (..),
     SelectCommand (..),
+    SsmCommand (..),
+    SsmListOptions (..),
+    SsmOptions (..),
+    SsmStatOptions (..),
     parseOptions,
   )
 where
@@ -48,6 +52,7 @@ data Command
   | CmdShow ProxySelection
   | CmdTest ProxySelection
   | CmdSelect SelectCommand
+  | CmdSsm SsmOptions
   deriving (Eq, Show)
 
 data ListOptions = ListOptions
@@ -70,6 +75,32 @@ data ProxyFilter
 data SelectCommand
   = SelectByOption Text
   | SelectBySelector Text Text
+  deriving (Eq, Show)
+
+data SsmOptions = SsmOptions
+  { ssmTargetTag :: Maybe Text,
+    ssmTargetEndpoint :: Maybe Text,
+    ssmSubcommand :: SsmCommand
+  }
+  deriving (Eq, Show)
+
+data SsmCommand
+  = SsmList SsmListOptions
+  | SsmShow [Text]
+  | SsmAdd Text (Maybe Text)
+  | SsmRemove [Text]
+  | SsmUpdate Text (Maybe Text)
+  | SsmStat SsmStatOptions
+  deriving (Eq, Show)
+
+newtype SsmListOptions = SsmListOptions
+  { ssmListShowPassword :: Bool
+  }
+  deriving (Eq, Show)
+
+newtype SsmStatOptions = SsmStatOptions
+  { ssmStatClear :: Bool
+  }
   deriving (Eq, Show)
 
 parseOptions :: IO Options
@@ -117,7 +148,7 @@ guessedInstanceOption =
       ( long "instance"
           <> short 'i'
           <> metavar "<<PATH>|<ADDR[:<PORT>]>>"
-          <> help "Target instance (config path or controller address, defaults to 127.0.0.1:9090)"
+          <> help "Target instance (config path or API address, defaults to 127.0.0.1:9090)"
       )
 
 configInstanceOption :: Parser InstanceTarget
@@ -135,7 +166,7 @@ addressInstanceOption =
     <$> strOption
       ( long "instance-address"
           <> metavar "ADDR[:<PORT>]"
-          <> help "Target controller address"
+          <> help "Target API address"
       )
 
 commandParser :: Parser Command
@@ -148,6 +179,7 @@ commandParser =
       <> command "show" (info showParser (progDesc "Show details of outbounds"))
       <> command "test" (info testParser (progDesc "Test delays of outbounds"))
       <> command "select" (info selectParser (progDesc "Select an option for a selector"))
+      <> command "ssm" (info ssmParser (progDesc "Manage Shadowsocks users via SSM API"))
 
 switchParser :: Parser Command
 switchParser =
@@ -208,6 +240,96 @@ selectParser =
             <*> optional (textArgument "OPTION" "Target option name")
         )
 
+ssmParser :: Parser Command
+ssmParser =
+  CmdSsm
+    <$> ( SsmOptions
+            <$> optional
+              ( textOption
+                  "tag"
+                  't'
+                  "NAME"
+                  "SSM API service tag from config services[]"
+              )
+            <*> optional
+              ( textOption
+                  "endpoint"
+                  'e'
+                  "PATH"
+                  "SSM API endpoint path, e.g. / or /edge"
+              )
+            <*> ssmCommandParser
+        )
+
+ssmCommandParser :: Parser SsmCommand
+ssmCommandParser =
+  hsubparser $
+    command "list" (info ssmListParser (progDesc "List SSM users"))
+      <> command "show" (info ssmShowParser (progDesc "Show detailed information for one or more users"))
+      <> command "add" (info ssmAddParser (progDesc "Add a user"))
+      <> command "remove" (info ssmRemoveParser (progDesc "Remove one or more users"))
+      <> command "update" (info ssmUpdateParser (progDesc "Update a user's password"))
+      <> command "stat" (info ssmStatParser (progDesc "Show SSM traffic statistics"))
+
+ssmListParser :: Parser SsmCommand
+ssmListParser =
+  SsmList
+    <$> ( SsmListOptions
+            <$> switch
+              ( long "show-password"
+                  <> short 'p'
+                  <> help "Show user pre-shared passwords in output"
+              )
+        )
+
+ssmShowParser :: Parser SsmCommand
+ssmShowParser =
+  SsmShow
+    <$> some
+      ( textArgument "USER" "Username"
+      )
+
+ssmAddParser :: Parser SsmCommand
+ssmAddParser =
+  SsmAdd
+    <$> textArgument "USER" "Username"
+    <*> optional
+      ( textOption
+          "password"
+          'p'
+          "TEXT"
+          "User pre-shared password; otherwise read silently from terminal"
+      )
+
+ssmRemoveParser :: Parser SsmCommand
+ssmRemoveParser =
+  SsmRemove
+    <$> some
+      ( textArgument "USER" "Username"
+      )
+
+ssmUpdateParser :: Parser SsmCommand
+ssmUpdateParser =
+  SsmUpdate
+    <$> textArgument "USER" "Username"
+    <*> optional
+      ( textOption
+          "password"
+          'p'
+          "TEXT"
+          "User pre-shared password; otherwise read silently from terminal"
+      )
+
+ssmStatParser :: Parser SsmCommand
+ssmStatParser =
+  SsmStat
+    <$> ( SsmStatOptions
+            <$> switch
+              ( long "clear"
+                  <> help "Clear counters after reading statistics"
+              )
+        )
+
 buildSelectCommand :: Text -> Maybe Text -> SelectCommand
 buildSelectCommand selectorOrOption maybeOption =
   case maybeOption of
@@ -235,5 +357,15 @@ textArgument name description =
   T.pack
     <$> strArgument
       ( metavar name
+          <> help description
+      )
+
+textOption :: String -> Char -> String -> String -> Parser Text
+textOption longName shortName valueName description =
+  T.pack
+    <$> strOption
+      ( long longName
+          <> short shortName
+          <> metavar valueName
           <> help description
       )

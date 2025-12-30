@@ -12,15 +12,16 @@ import Boxctl.Domain
     GroupDetails (..),
     Proxy,
     ProxyShape (..),
+    SsmUser (..),
     clashModeMatchesKnown,
-    knownClashModeText,
     isSelectorProxy,
     isUrlTestProxy,
+    knownClashModeText,
     proxyName,
     proxyShape,
   )
 import Boxctl.Error
-import Boxctl.Instance (resolveInstance)
+import Boxctl.Instance (resolveInstance, resolveSsmInstance)
 import Boxctl.Output
   ( CommandDiagnostic (..),
     CommandDiagnosticVisibility (..),
@@ -31,6 +32,7 @@ import Boxctl.Output
   )
 import Boxctl.Terminal (resolveRenderStyle)
 import Control.Concurrent.Async (mapConcurrently)
+import Control.Exception (bracket_)
 import Control.Monad (unless)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE, withExceptT)
@@ -40,14 +42,21 @@ import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Text (Text)
 import qualified Data.Text as T
+import qualified Data.Text.IO as TIO
 import Data.Version (showVersion)
 import Paths_boxctl (version)
+import System.IO (hFlush, hGetEcho, hIsTerminalDevice, hSetEcho, stderr, stdin)
 
 data CommandReport = CommandReport
   { reportOutput :: CommandOutput,
     reportDiagnostics :: [CommandDiagnostic],
     reportFailure :: Maybe CommandError
   }
+
+data NameMatch a
+  = MissingName
+  | UniqueName a
+  | AmbiguousName [a]
 
 run :: Options -> ExceptT BoxctlError IO ()
 run options = do
@@ -68,13 +77,28 @@ executeCommand options =
   case optCommand options of
     CmdVersion ->
       runVersionCommand options
+    CmdSsm ssmOptions -> do
+      controller <- resolveSsmController options ssmOptions
+      runSsmCommand controller ssmOptions
     command -> do
-      controller <- resolveController options
+      controller <- resolveClashController options
       runControllerCommand controller command
 
-resolveController :: Options -> ExceptT BoxctlError IO Controller
-resolveController options = do
+resolveClashController :: Options -> ExceptT BoxctlError IO Controller
+resolveClashController options = do
   resolvedInstance <- withExceptT BoxctlInstanceError (resolveInstance (optInstanceTarget options))
+  liftIO (mkController resolvedInstance (optVerbose options))
+
+resolveSsmController :: Options -> SsmOptions -> ExceptT BoxctlError IO Controller
+resolveSsmController options ssmOptions = do
+  resolvedInstance <-
+    withExceptT
+      BoxctlInstanceError
+      ( resolveSsmInstance
+          (optInstanceTarget options)
+          (ssmTargetTag ssmOptions)
+          (ssmTargetEndpoint ssmOptions)
+      )
   liftIO (mkController resolvedInstance (optVerbose options))
 
 runVersionCommand :: Options -> ExceptT BoxctlError IO CommandReport
@@ -84,7 +108,7 @@ runVersionCommand options = do
     liftIO $
       runExceptT $
         do
-          controller <- resolveController options
+          controller <- resolveClashController options
           withExceptT BoxctlApiError (fetchVersion controller)
   pure $
     case serverVersionResult of
@@ -131,10 +155,7 @@ runControllerCommand controller command =
       tested <- liftIO (mapConcurrently (runExceptT . testProxy controller) proxies)
       let (errs, results) = partitionEithers tested
           renderedErrors = map renderBoxctlError errs
-          diagnostics =
-            map
-              (\message -> CommandDiagnostic {diagnosticVisibility = DiagnosticHumanOnly, diagnosticText = message})
-              renderedErrors
+          diagnostics = humanOnlyDiagnostics renderedErrors
           failure
             | null results = Just NoDelayResults
             | null errs = Nothing
@@ -150,6 +171,113 @@ runControllerCommand controller command =
       (selectorProxy, selectorOption) <- exceptCommand (resolveSelector proxies selectCommand)
       withExceptT BoxctlApiError (selectProxyOption controller (proxyName selectorProxy) selectorOption)
       pure (successReport (CommandOutputSelect (proxyName selectorProxy) selectorOption))
+    CmdSsm _ ->
+      error "runControllerCommand: unexpected SSM command"
+
+runSsmCommand :: Controller -> SsmOptions -> ExceptT BoxctlError IO CommandReport
+runSsmCommand controller ssmOptions =
+  case ssmSubcommand ssmOptions of
+    SsmList listOptions -> do
+      users <- withExceptT BoxctlApiError (listSsmUsers controller)
+      pure (successReport (CommandOutputSsmList (ssmListShowPassword listOptions) users))
+    SsmShow requestedUserNames ->
+      runSsmShow controller requestedUserNames
+    SsmAdd userName maybePassword -> do
+      password <- resolvePasswordValue ("Password for " <> userName) maybePassword
+      withExceptT BoxctlApiError (addSsmUser controller userName password)
+      pure (successReport (CommandOutputSsmAdd userName))
+    SsmRemove requestedUserNames ->
+      runSsmRemove controller requestedUserNames
+    SsmUpdate userName maybePassword -> do
+      password <- resolvePasswordValue ("Password for " <> userName) maybePassword
+      withExceptT BoxctlApiError (updateSsmUserPassword controller userName password)
+      pure (successReport (CommandOutputSsmUpdate userName))
+    SsmStat statOptions -> do
+      stats <- withExceptT BoxctlApiError (fetchSsmStats controller (ssmStatClear statOptions))
+      pure (successReport (CommandOutputSsmStat (ssmStatClear statOptions) stats))
+
+runSsmShow :: Controller -> [Text] -> ExceptT BoxctlError IO CommandReport
+runSsmShow controller requestedUserNames = do
+  users <- withExceptT BoxctlApiError (listSsmUsers controller)
+  selectedUsers <- exceptCommand (resolveUsersByName users requestedUserNames)
+  fetchedUsers <-
+    liftIO $
+      mapConcurrently
+        ( runExceptT
+            . withExceptT BoxctlApiError
+            . fetchSsmUser controller
+            . ssmUserName
+        )
+        selectedUsers
+  let (errs, detailedUsers) = partitionEithers fetchedUsers
+      renderedErrors = map renderBoxctlError errs
+      diagnostics = humanOnlyDiagnostics renderedErrors
+      failure
+        | null errs = Nothing
+        | otherwise = Just SsmShowFailed
+  pure
+    CommandReport
+      { reportOutput = CommandOutputSsmShow detailedUsers renderedErrors,
+        reportDiagnostics = diagnostics,
+        reportFailure = failure
+      }
+
+runSsmRemove :: Controller -> [Text] -> ExceptT BoxctlError IO CommandReport
+runSsmRemove controller requestedUserNames = do
+  users <- withExceptT BoxctlApiError (listSsmUsers controller)
+  selectedUsers <- exceptCommand (resolveUsersByName users requestedUserNames)
+  removedUsers <-
+    liftIO $
+      mapConcurrently
+        ( runExceptT
+            . removeResolvedUser controller
+            . ssmUserName
+        )
+        selectedUsers
+  let (errs, removedUserNames) = partitionEithers removedUsers
+      renderedErrors = map renderBoxctlError errs
+      diagnostics = humanOnlyDiagnostics renderedErrors
+      failure
+        | null errs = Nothing
+        | otherwise = Just SsmRemoveFailed
+  pure
+    CommandReport
+      { reportOutput = CommandOutputSsmRemove removedUserNames renderedErrors,
+        reportDiagnostics = diagnostics,
+        reportFailure = failure
+      }
+
+removeResolvedUser :: Controller -> Text -> ExceptT BoxctlError IO Text
+removeResolvedUser controller userName = do
+  withExceptT BoxctlApiError (removeSsmUser controller userName)
+  pure userName
+
+resolvePasswordValue :: Text -> Maybe Text -> ExceptT BoxctlError IO Text
+resolvePasswordValue promptLabel maybePassword = do
+  password <-
+    case maybePassword of
+      Just providedPassword -> pure providedPassword
+      Nothing -> promptPassword promptLabel
+  if T.null (T.strip password)
+    then throwE (BoxctlCommandError EmptyPassword)
+    else pure password
+
+promptPassword :: Text -> ExceptT BoxctlError IO Text
+promptPassword promptLabel = do
+  isInteractive <- liftIO (hIsTerminalDevice stdin)
+  unless isInteractive $
+    throwE (BoxctlCommandError PasswordPromptUnavailable)
+  liftIO $ do
+    originalEcho <- hGetEcho stdin
+    TIO.hPutStr stderr (promptLabel <> ": ")
+    hFlush stderr
+    password <-
+      bracket_
+        (hSetEcho stdin False)
+        (hSetEcho stdin originalEcho)
+        (TIO.hGetLine stdin)
+    TIO.hPutStrLn stderr ""
+    pure password
 
 successReport :: CommandOutput -> CommandReport
 successReport output =
@@ -158,6 +286,11 @@ successReport output =
       reportDiagnostics = [],
       reportFailure = Nothing
     }
+
+humanOnlyDiagnostics :: [Text] -> [CommandDiagnostic]
+humanOnlyDiagnostics =
+  map
+    (\message -> CommandDiagnostic {diagnosticVisibility = DiagnosticHumanOnly, diagnosticText = message})
 
 exceptCommand :: Either CommandError a -> ExceptT BoxctlError IO a
 exceptCommand =
@@ -186,6 +319,28 @@ selectProxiesFrom selection allProxies =
     ensureMatch proxy
       | filterMatches (selectionFilter selection) proxy = Right proxy
       | otherwise = Left (OutboundDoesNotMatchFilter (proxyName proxy))
+
+resolveUsersByName :: [SsmUser] -> [Text] -> Either CommandError [SsmUser]
+resolveUsersByName users =
+  traverse (resolveUserByName users) . dedupeTextValues
+
+resolveUserByName :: [SsmUser] -> Text -> Either CommandError SsmUser
+resolveUserByName users requestedName =
+  case findByName ssmUserName users requestedName of
+    MissingName ->
+      Left (UserNotFound requestedName)
+    UniqueName user ->
+      Right user
+    AmbiguousName matches ->
+      Left (AmbiguousUser requestedName (map ssmUserName matches))
+
+dedupeTextValues :: [Text] -> [Text]
+dedupeTextValues =
+  foldl' insertIfMissing []
+  where
+    insertIfMissing acc value
+      | any (`textEqualsFold` value) acc = acc
+      | otherwise = acc <> [value]
 
 resolveSelector :: [Proxy] -> SelectCommand -> Either CommandError (Proxy, Text)
 resolveSelector proxies selectCommand = do
@@ -259,21 +414,18 @@ proxyIndex :: [Proxy] -> Map Text Proxy
 proxyIndex proxies =
   Map.fromList [(proxyName proxy, proxy) | proxy <- proxies]
 
-data NameMatch a
-  = MissingName
-  | UniqueName a
-  | AmbiguousName [a]
-
 findByName :: (a -> Text) -> [a] -> Text -> NameMatch a
 findByName getName values requestedName =
   case filter (\value -> getName value == requestedName) values of
-    value : _ ->
+    [value] ->
       UniqueName value
     [] ->
       case filter (\value -> textEqualsFold (getName value) requestedName) values of
         [] -> MissingName
         [value] -> UniqueName value
         matches -> AmbiguousName matches
+    matches ->
+      AmbiguousName matches
 
 resolveProxyByName :: [Proxy] -> Text -> Either CommandError Proxy
 resolveProxyByName proxies requestedName =

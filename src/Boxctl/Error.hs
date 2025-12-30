@@ -28,6 +28,14 @@ data InstanceError
   | InstanceConfigParseError Text
   | MissingClashApiConfig
   | MissingExternalController
+  | MissingSsmApiServices
+  | SsmApiServiceTagNotFound Text
+  | MultipleSsmApiServices [Text]
+  | MissingSsmApiServiceEndpoints Text
+  | SsmApiEndpointNotFound Text
+  | MultipleSsmApiEndpoints Text [Text]
+  | MissingSsmApiListen Text
+  | MissingSsmApiListenPort Text
   | InvalidInstanceAddress Text
   deriving (Eq, Show)
 
@@ -55,9 +63,15 @@ data CommandError
   | AmbiguousSelector Text [Text]
   | OptionNotFound Text Text
   | AmbiguousOption Text Text [Text]
+  | UserNotFound Text
+  | AmbiguousUser Text [Text]
+  | PasswordPromptUnavailable
+  | EmptyPassword
   | DelayProbeFailed Text ApiError
   | NoDelayResults
   | DelayTestsFailed
+  | SsmShowFailed
+  | SsmRemoveFailed
   deriving (Eq, Show)
 
 renderBoxctlError :: BoxctlError -> Text
@@ -78,6 +92,26 @@ renderInstanceError = \case
     "config file does not contain experimental.clash_api"
   MissingExternalController ->
     "config file does not contain experimental.clash_api.external_controller"
+  MissingSsmApiServices ->
+    "config file does not contain any ssm-api services"
+  SsmApiServiceTagNotFound tagName ->
+    "ssm-api service tag not found: " <> tagName
+  MultipleSsmApiServices tags ->
+    "multiple ssm-api services available, specify --tag: "
+      <> T.intercalate ", " tags
+  MissingSsmApiServiceEndpoints serviceLabel ->
+    "ssm-api service has no configured endpoints: " <> serviceLabel
+  SsmApiEndpointNotFound endpoint ->
+    "ssm-api endpoint not found: " <> endpoint
+  MultipleSsmApiEndpoints serviceLabel endpoints ->
+    "multiple ssm-api endpoints available in "
+      <> serviceLabel
+      <> ", specify --endpoint: "
+      <> T.intercalate ", " endpoints
+  MissingSsmApiListen serviceLabel ->
+    "ssm-api service is missing listen address: " <> serviceLabel
+  MissingSsmApiListenPort serviceLabel ->
+    "ssm-api service is missing listen_port: " <> serviceLabel
   InvalidInstanceAddress err ->
     err
 
@@ -134,12 +168,28 @@ renderCommandError = \case
       <> " (matches: "
       <> T.intercalate ", " matches
       <> ")"
+  UserNotFound userName ->
+    "user not found: " <> userName
+  AmbiguousUser requested matches ->
+    "ambiguous user: "
+      <> requested
+      <> " (matches: "
+      <> T.intercalate ", " matches
+      <> ")"
+  PasswordPromptUnavailable ->
+    "password not provided and no interactive terminal is available; use --password"
+  EmptyPassword ->
+    "password must not be empty"
   DelayProbeFailed proxyName apiError ->
     proxyName <> ": " <> renderApiError apiError
   NoDelayResults ->
     "no delay results were produced"
   DelayTestsFailed ->
     "one or more delay tests failed"
+  SsmShowFailed ->
+    "one or more user detail requests failed"
+  SsmRemoveFailed ->
+    "one or more user removals failed"
 
 apiDelayFailureLabel :: ApiError -> Maybe Text
 apiDelayFailureLabel = \case

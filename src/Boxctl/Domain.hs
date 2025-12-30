@@ -11,6 +11,8 @@ module Boxctl.Domain
     Proxy (..),
     ProxyMeta (..),
     ProxyShape (..),
+    SsmStats (..),
+    SsmUser (..),
     VersionInfo (..),
     clashModeFromText,
     clashModeMatchesKnown,
@@ -31,6 +33,7 @@ module Boxctl.Domain
 where
 
 import Data.Aeson (ToJSON (..), Value (String), object, (.=))
+import Data.Int (Int64)
 import Data.Text (Text)
 import qualified Data.Text as T
 import Data.Time (UTCTime)
@@ -96,6 +99,29 @@ data Proxy = Proxy
   }
   deriving (Eq, Show)
 
+data SsmUser = SsmUser
+  { ssmUserName :: Text,
+    ssmUserPassword :: Maybe Text,
+    ssmUserDownlinkBytes :: Int64,
+    ssmUserUplinkBytes :: Int64,
+    ssmUserDownlinkPackets :: Int64,
+    ssmUserUplinkPackets :: Int64,
+    ssmUserTcpSessions :: Int64,
+    ssmUserUdpSessions :: Int64
+  }
+  deriving (Eq, Show)
+
+data SsmStats = SsmStats
+  { ssmStatsUplinkBytes :: Int64,
+    ssmStatsDownlinkBytes :: Int64,
+    ssmStatsUplinkPackets :: Int64,
+    ssmStatsDownlinkPackets :: Int64,
+    ssmStatsTcpSessions :: Int64,
+    ssmStatsUdpSessions :: Int64,
+    ssmStatsUsers :: [SsmUser]
+  }
+  deriving (Eq, Show)
+
 instance ToJSON KnownClashMode where
   toJSON = String . knownClashModeText
 
@@ -142,6 +168,31 @@ instance ToJSON Proxy where
             [ "now" .= groupCurrent details,
               "all" .= groupMembers details
             ]
+
+instance ToJSON SsmUser where
+  toJSON user =
+    object $
+      [ "username" .= ssmUserName user,
+        "downlinkBytes" .= ssmUserDownlinkBytes user,
+        "uplinkBytes" .= ssmUserUplinkBytes user,
+        "downlinkPackets" .= ssmUserDownlinkPackets user,
+        "uplinkPackets" .= ssmUserUplinkPackets user,
+        "tcpSessions" .= ssmUserTcpSessions user,
+        "udpSessions" .= ssmUserUdpSessions user
+      ]
+        <> maybe [] (\password -> ["password" .= password]) (ssmUserPassword user)
+
+instance ToJSON SsmStats where
+  toJSON stats =
+    object
+      [ "uplinkBytes" .= ssmStatsUplinkBytes stats,
+        "downlinkBytes" .= ssmStatsDownlinkBytes stats,
+        "uplinkPackets" .= ssmStatsUplinkPackets stats,
+        "downlinkPackets" .= ssmStatsDownlinkPackets stats,
+        "tcpSessions" .= ssmStatsTcpSessions stats,
+        "udpSessions" .= ssmStatsUdpSessions stats,
+        "users" .= ssmStatsUsers stats
+      ]
 
 knownClashModeFromText :: Text -> Maybe KnownClashMode
 knownClashModeFromText rawValue =

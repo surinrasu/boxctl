@@ -21,6 +21,8 @@ import Boxctl.Domain
     GroupDetails (..),
     Proxy,
     ProxyShape (..),
+    SsmStats (..),
+    SsmUser (..),
     VersionInfo (..),
     clashModeText,
     isGroupProxy,
@@ -38,6 +40,7 @@ import Data.Bits (rotateR, shiftR, xor)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Foldable (traverse_)
+import Data.Int (Int64)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
@@ -123,6 +126,12 @@ data CommandOutput
   | CommandOutputShow (Map Text Proxy) [Proxy]
   | CommandOutputTest [TestResult] [Text]
   | CommandOutputSelect Text Text
+  | CommandOutputSsmList Bool [SsmUser]
+  | CommandOutputSsmShow [SsmUser] [Text]
+  | CommandOutputSsmAdd Text
+  | CommandOutputSsmRemove [Text] [Text]
+  | CommandOutputSsmUpdate Text
+  | CommandOutputSsmStat Bool SsmStats
   deriving (Eq, Show)
 
 emitCommandOutput :: OutputMode -> RenderStyle -> [CommandDiagnostic] -> CommandOutput -> IO ()
@@ -160,6 +169,20 @@ renderCommandHuman renderStyle = \case
     | otherwise -> Just (renderTestResults renderStyle results)
   CommandOutputSelect selectorName optionName ->
     Just (renderSelect selectorName optionName)
+  CommandOutputSsmList showPassword users ->
+    Just (renderSsmUserList showPassword users)
+  CommandOutputSsmShow users _
+    | null users -> Nothing
+    | otherwise -> Just (renderSsmUserDetails users)
+  CommandOutputSsmAdd userName ->
+    Just ("added user: " <> userName)
+  CommandOutputSsmRemove userNames _
+    | null userNames -> Nothing
+    | otherwise -> Just (renderSsmRemovedUsers userNames)
+  CommandOutputSsmUpdate userName ->
+    Just ("updated password: " <> userName)
+  CommandOutputSsmStat cleared stats ->
+    Just (renderSsmStats cleared stats)
 
 renderCommandJson :: CommandOutput -> Value
 renderCommandJson = \case
@@ -190,6 +213,34 @@ renderCommandJson = \case
       [ "selector" .= selectorName,
         "selected" .= optionName
       ]
+  CommandOutputSsmList showPassword users ->
+    object ["users" .= sanitizeSsmUsers showPassword users]
+  CommandOutputSsmShow users errors ->
+    object
+      [ "users" .= users,
+        "errors" .= errors
+      ]
+  CommandOutputSsmAdd userName ->
+    object
+      [ "action" .= ("add" :: Text),
+        "user" .= userName
+      ]
+  CommandOutputSsmRemove userNames errors ->
+    object
+      [ "action" .= ("remove" :: Text),
+        "users" .= userNames,
+        "errors" .= errors
+      ]
+  CommandOutputSsmUpdate userName ->
+    object
+      [ "action" .= ("update" :: Text),
+        "user" .= userName
+      ]
+  CommandOutputSsmStat cleared stats ->
+    object
+      [ "cleared" .= cleared,
+        "stats" .= stats
+      ]
 
 renderVersion :: Text -> Maybe VersionInfo -> Text
 renderVersion localVersion maybeVersionInfo =
@@ -215,6 +266,152 @@ renderSwitch config = "mode: " <> clashModeText (configMode config)
 renderSelect :: Text -> Text -> Text
 renderSelect selectorName optionName =
   selectorName <> ": " <> optionName
+
+renderSsmUserList :: Bool -> [SsmUser] -> Text
+renderSsmUserList showPassword users =
+  T.intercalate "\n\n" (catMaybes [usersSection, hiddenPasswordsNote])
+  where
+    orderedUsers = sortOn (T.toCaseFold . ssmUserName) users
+    renderedUsers = sanitizeSsmUsers showPassword orderedUsers
+    usersSection =
+      Just $
+        renderSection
+          "Users"
+          ( if null renderedUsers
+              then ["none"]
+              else map renderUserRow renderedUsers
+          )
+    hiddenPasswords =
+      length [() | user <- orderedUsers, ssmUserPassword user /= Nothing]
+    hiddenPasswordsNote
+      | showPassword || hiddenPasswords == 0 = Nothing
+      | otherwise =
+          Just
+            ( T.pack (show hiddenPasswords)
+                <> " user passwords hidden; run: boxctl ssm list --show-password"
+            )
+    renderUserRow user =
+      case ssmUserPassword user of
+        Nothing ->
+          ssmUserName user
+        Just password ->
+          ssmUserName user <> "  password=" <> password
+
+renderSsmUserDetails :: [SsmUser] -> Text
+renderSsmUserDetails =
+  T.intercalate "\n\n"
+    . map renderUser
+    . sortOn (T.toCaseFold . ssmUserName)
+  where
+    renderUser user =
+      T.unlines
+        [ ssmUserName user,
+          "password: " <> fromMaybe "-" (ssmUserPassword user),
+          renderTrafficLine "uplink" (ssmUserUplinkBytes user) (ssmUserUplinkPackets user),
+          renderTrafficLine "downlink" (ssmUserDownlinkBytes user) (ssmUserDownlinkPackets user),
+          "tcp sessions: " <> renderCount (ssmUserTcpSessions user),
+          "udp sessions: " <> renderCount (ssmUserUdpSessions user)
+        ]
+
+renderSsmRemovedUsers :: [Text] -> Text
+renderSsmRemovedUsers userNames =
+  case sortOn T.toCaseFold userNames of
+    [] -> ""
+    [userName] -> "removed user: " <> userName
+    orderedUsers ->
+      T.unlines $
+        ["removed users:"]
+          <> map ("  " <>) orderedUsers
+
+renderSsmStats :: Bool -> SsmStats -> Text
+renderSsmStats cleared stats =
+  T.intercalate "\n\n" (catMaybes [globalSection, usersSection, clearedNote])
+  where
+    globalSection =
+      Just $
+        renderSection
+          "Global"
+          [ renderTrafficLine "uplink" (ssmStatsUplinkBytes stats) (ssmStatsUplinkPackets stats),
+            renderTrafficLine "downlink" (ssmStatsDownlinkBytes stats) (ssmStatsDownlinkPackets stats),
+            "tcp sessions: " <> renderCount (ssmStatsTcpSessions stats),
+            "udp sessions: " <> renderCount (ssmStatsUdpSessions stats)
+          ]
+    orderedUsers = sortOn (T.toCaseFold . ssmUserName) (ssmStatsUsers stats)
+    usersSection =
+      Just $
+        renderSection
+          "Users"
+          ( if null orderedUsers
+              then ["none"]
+              else map renderStatsUserRow orderedUsers
+          )
+    clearedNote
+      | cleared = Just "counters were cleared after this read"
+      | otherwise = Nothing
+    renderStatsUserRow user =
+      T.intercalate
+        "  "
+        [ ssmUserName user,
+          "up=" <> renderByteCount (ssmUserUplinkBytes user),
+          "down=" <> renderByteCount (ssmUserDownlinkBytes user),
+          "tcp=" <> renderCount (ssmUserTcpSessions user),
+          "udp=" <> renderCount (ssmUserUdpSessions user)
+        ]
+
+sanitizeSsmUsers :: Bool -> [SsmUser] -> [SsmUser]
+sanitizeSsmUsers showPassword
+  | showPassword = id
+  | otherwise = map hideSsmUserPassword
+
+hideSsmUserPassword :: SsmUser -> SsmUser
+hideSsmUserPassword user =
+  user {ssmUserPassword = Nothing}
+
+renderTrafficLine :: Text -> Int64 -> Int64 -> Text
+renderTrafficLine label byteCount packetCount =
+  label
+    <> ": "
+    <> renderByteCount byteCount
+    <> "  packets="
+    <> renderCount packetCount
+
+renderByteCount :: Int64 -> Text
+renderByteCount byteCount =
+  humanReadable <> " (" <> T.pack (show byteCount) <> " B)"
+  where
+    (scaledValue, unit) = scaleBytes (fromIntegral byteCount :: Double) byteUnits
+    humanReadable =
+      formatScaledValue scaledValue <> " " <> unit
+
+scaleBytes :: Double -> [Text] -> (Double, Text)
+scaleBytes value = go value
+  where
+    go currentValue [] = (currentValue, "B")
+    go currentValue [unit] = (currentValue, unit)
+    go currentValue (unit : nextUnit : remainingUnits)
+      | currentValue < 1024 = (currentValue, unit)
+      | otherwise = go (currentValue / 1024) (nextUnit : remainingUnits)
+
+byteUnits :: [Text]
+byteUnits = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"]
+
+formatScaledValue :: Double -> Text
+formatScaledValue value
+  | value >= 100 = T.pack (show (round value :: Int))
+  | value >= 10 = fixedPoint 1 value
+  | otherwise = fixedPoint 2 value
+
+fixedPoint :: Int -> Double -> Text
+fixedPoint decimals value =
+  T.pack (show roundedValue)
+  where
+    multiplier = (10 :: Int) ^ decimals
+    roundedValue =
+      fromIntegral (round (value * fromIntegral multiplier) :: Int) / fromIntegral multiplier :: Double
+
+renderCount :: Int64 -> Text
+renderCount =
+  T.pack . show
 
 renderList :: RenderStyle -> ListOptions -> [Proxy] -> Text
 renderList renderStyle listOptions proxies =

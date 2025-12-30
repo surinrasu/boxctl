@@ -3,14 +3,20 @@
 
 module Boxctl.API
   ( Controller,
+    addSsmUser,
     fetchConfigs,
     fetchGroupDelay,
     fetchProxies,
     fetchProxyDelay,
+    fetchSsmStats,
+    fetchSsmUser,
     fetchVersion,
+    listSsmUsers,
     mkController,
+    removeSsmUser,
     selectProxyOption,
     switchMode,
+    updateSsmUserPassword,
   )
 where
 
@@ -23,6 +29,8 @@ import Boxctl.Domain
     Proxy (..),
     ProxyMeta (..),
     ProxyShape (..),
+    SsmStats (..),
+    SsmUser (..),
     VersionInfo (..),
     clashModeFromText,
     proxyName,
@@ -61,7 +69,7 @@ import Network.HTTP.Client
     responseStatus,
   )
 import Network.HTTP.Client.TLS (newTlsManager)
-import Network.HTTP.Types (methodGet, methodPatch, methodPut)
+import Network.HTTP.Types (methodDelete, methodGet, methodPatch, methodPost, methodPut)
 import Network.HTTP.Types.Status (statusCode)
 import Network.HTTP.Types.URI (renderQuery, urlEncode)
 import System.IO (stderr)
@@ -95,11 +103,34 @@ newtype ApiDelay = ApiDelay
   { unApiDelay :: Int
   }
 
+data ApiSsmUser = ApiSsmUser
+  { apiSsmUserName :: Text,
+    apiSsmUserPassword :: Maybe Text,
+    apiSsmUserDownlinkBytes :: Int,
+    apiSsmUserUplinkBytes :: Int,
+    apiSsmUserDownlinkPackets :: Int,
+    apiSsmUserUplinkPackets :: Int,
+    apiSsmUserTcpSessions :: Int,
+    apiSsmUserUdpSessions :: Int
+  }
+
+newtype ApiSsmUserEnvelope = ApiSsmUserEnvelope
+  { unApiSsmUserEnvelope :: [SsmUser]
+  }
+
+newtype ApiSsmStats = ApiSsmStats
+  { unApiSsmStats :: SsmStats
+  }
+
 newtype ApiErrorResponse = ApiErrorResponse Text
 
 newtype ModePatch = ModePatch KnownClashMode
 
 newtype SelectRequest = SelectRequest Text
+
+data AddSsmUserRequest = AddSsmUserRequest Text Text
+
+newtype UpdateSsmUserRequest = UpdateSsmUserRequest Text
 
 instance FromJSON ApiVersion where
   parseJSON = withObject "VersionResponse" $ \obj ->
@@ -139,6 +170,35 @@ instance FromJSON ApiDelay where
   parseJSON = withObject "DelayResponse" $ \obj ->
     ApiDelay <$> obj .: "delay"
 
+instance FromJSON ApiSsmUser where
+  parseJSON = withObject "ApiSsmUser" $ \obj ->
+    ApiSsmUser
+      <$> obj .: "username"
+      <*> obj .:? "uPSK"
+      <*> obj .:? "downlinkBytes" .!= 0
+      <*> obj .:? "uplinkBytes" .!= 0
+      <*> obj .:? "downlinkPackets" .!= 0
+      <*> obj .:? "uplinkPackets" .!= 0
+      <*> obj .:? "tcpSessions" .!= 0
+      <*> obj .:? "udpSessions" .!= 0
+
+instance FromJSON ApiSsmUserEnvelope where
+  parseJSON = withObject "SsmUserEnvelope" $ \obj ->
+    ApiSsmUserEnvelope . map toDomainSsmUser <$> obj .: "users"
+
+instance FromJSON ApiSsmStats where
+  parseJSON = withObject "SsmStats" $ \obj ->
+    ApiSsmStats
+      <$> ( SsmStats
+              <$> obj .:? "uplinkBytes" .!= 0
+              <*> obj .:? "downlinkBytes" .!= 0
+              <*> obj .:? "uplinkPackets" .!= 0
+              <*> obj .:? "downlinkPackets" .!= 0
+              <*> obj .:? "tcpSessions" .!= 0
+              <*> obj .:? "udpSessions" .!= 0
+              <*> (map toDomainSsmUser <$> (obj .:? "users" .!= []))
+          )
+
 instance FromJSON ApiProxyEnvelope where
   parseJSON = withObject "ProxyEnvelope" $ \obj ->
     ApiProxyEnvelope <$> obj .: "proxies"
@@ -154,6 +214,17 @@ instance ToJSON ModePatch where
 instance ToJSON SelectRequest where
   toJSON (SelectRequest name) =
     object ["name" .= name]
+
+instance ToJSON AddSsmUserRequest where
+  toJSON (AddSsmUserRequest userName password) =
+    object
+      [ "username" .= userName,
+        "uPSK" .= password
+      ]
+
+instance ToJSON UpdateSsmUserRequest where
+  toJSON (UpdateSsmUserRequest password) =
+    object ["uPSK" .= password]
 
 mkController :: ResolvedInstance -> Bool -> IO Controller
 mkController controllerInstance controllerVerbose = do
@@ -193,6 +264,49 @@ fetchProxyDelay controller targetName timeoutMs =
 fetchGroupDelay :: Controller -> Text -> Int -> ExceptT ApiError IO (Map Text Int)
 fetchGroupDelay controller targetName timeoutMs =
   requestJson controller methodGet ["group", targetName, "delay"] (delayQuery timeoutMs) Nothing
+
+listSsmUsers :: Controller -> ExceptT ApiError IO [SsmUser]
+listSsmUsers controller =
+  unApiSsmUserEnvelope <$> requestJson controller methodGet ["users"] [] Nothing
+
+fetchSsmUser :: Controller -> Text -> ExceptT ApiError IO SsmUser
+fetchSsmUser controller userName =
+  toDomainSsmUser <$> requestJson controller methodGet ["users", userName] [] Nothing
+
+addSsmUser :: Controller -> Text -> Text -> ExceptT ApiError IO ()
+addSsmUser controller userName password =
+  requestNoContent controller methodPost ["users"] [] (Just (toJSON (AddSsmUserRequest userName password)))
+
+updateSsmUserPassword :: Controller -> Text -> Text -> ExceptT ApiError IO ()
+updateSsmUserPassword controller userName password =
+  requestNoContent controller methodPut ["users", userName] [] (Just (toJSON (UpdateSsmUserRequest password)))
+
+removeSsmUser :: Controller -> Text -> ExceptT ApiError IO ()
+removeSsmUser controller userName =
+  requestNoContent controller methodDelete ["users", userName] [] Nothing
+
+fetchSsmStats :: Controller -> Bool -> ExceptT ApiError IO SsmStats
+fetchSsmStats controller shouldClear =
+  unApiSsmStats
+    <$> requestJson
+      controller
+      methodGet
+      ["stats"]
+      [("clear", Just "true") | shouldClear]
+      Nothing
+
+toDomainSsmUser :: ApiSsmUser -> SsmUser
+toDomainSsmUser apiUser =
+  SsmUser
+    { ssmUserName = apiSsmUserName apiUser,
+      ssmUserPassword = apiSsmUserPassword apiUser,
+      ssmUserDownlinkBytes = fromIntegral (apiSsmUserDownlinkBytes apiUser),
+      ssmUserUplinkBytes = fromIntegral (apiSsmUserUplinkBytes apiUser),
+      ssmUserDownlinkPackets = fromIntegral (apiSsmUserDownlinkPackets apiUser),
+      ssmUserUplinkPackets = fromIntegral (apiSsmUserUplinkPackets apiUser),
+      ssmUserTcpSessions = fromIntegral (apiSsmUserTcpSessions apiUser),
+      ssmUserUdpSessions = fromIntegral (apiSsmUserUdpSessions apiUser)
+    }
 
 selectProxyOption :: Controller -> Text -> Text -> ExceptT ApiError IO ()
 selectProxyOption controller selectorName optionName =
