@@ -13,6 +13,9 @@ module Boxctl.Domain
     ProxyShape (..),
     SsmStats (..),
     SsmUser (..),
+    TailscaleEndpointStatus (..),
+    TailscaleIPResult (..),
+    TailscalePeer (..),
     VersionInfo (..),
     clashModeFromText,
     clashModeMatchesKnown,
@@ -60,6 +63,41 @@ data VersionInfo = VersionInfo
 data Config = Config
   { configMode :: ClashMode,
     configModeList :: [ClashMode]
+  }
+  deriving (Eq, Show)
+
+data TailscalePeer = TailscalePeer
+  { tailscalePeerName :: Text,
+    tailscalePeerHostName :: Maybe Text,
+    tailscalePeerDNSName :: Maybe Text,
+    tailscalePeerOS :: Maybe Text,
+    tailscalePeerIPs :: [Text],
+    tailscalePeerOnline :: Maybe Bool,
+    tailscalePeerLastSeen :: Maybe UTCTime,
+    tailscalePeerKeyExpiry :: Maybe UTCTime
+  }
+  deriving (Eq, Show)
+
+data TailscaleEndpointStatus = TailscaleEndpointStatus
+  { tailscaleEndpointLabel :: Text,
+    tailscaleEndpointTag :: Maybe Text,
+    tailscaleEndpointStateDirectory :: FilePath,
+    tailscaleEndpointSource :: Text,
+    tailscaleEndpointTailnetName :: Maybe Text,
+    tailscaleEndpointMagicDNSSuffix :: Maybe Text,
+    tailscaleEndpointSnapshotTime :: Maybe UTCTime,
+    tailscaleEndpointAvailable :: Bool,
+    tailscaleEndpointReason :: Maybe Text,
+    tailscaleEndpointSelf :: Maybe TailscalePeer,
+    tailscaleEndpointPeers :: [TailscalePeer]
+  }
+  deriving (Eq, Show)
+
+data TailscaleIPResult = TailscaleIPResult
+  { tailscaleIPResultEndpoint :: Text,
+    tailscaleIPResultPeer :: Maybe Text,
+    tailscaleIPResultAddresses :: [Text],
+    tailscaleIPResultSnapshotTime :: Maybe UTCTime
   }
   deriving (Eq, Show)
 
@@ -142,6 +180,44 @@ instance ToJSON Config where
       [ "mode" .= configMode config,
         "mode-list" .= configModeList config
       ]
+
+instance ToJSON TailscalePeer where
+  toJSON peer =
+    object $
+      [ "name" .= tailscalePeerName peer,
+        "ips" .= tailscalePeerIPs peer
+      ]
+        <> maybe [] (\value -> ["hostName" .= value]) (tailscalePeerHostName peer)
+        <> maybe [] (\value -> ["dnsName" .= value]) (tailscalePeerDNSName peer)
+        <> maybe [] (\value -> ["os" .= value]) (tailscalePeerOS peer)
+        <> maybe [] (\value -> ["online" .= value]) (tailscalePeerOnline peer)
+        <> maybe [] (\value -> ["lastSeen" .= value]) (tailscalePeerLastSeen peer)
+        <> maybe [] (\value -> ["keyExpiry" .= value]) (tailscalePeerKeyExpiry peer)
+
+instance ToJSON TailscaleEndpointStatus where
+  toJSON status =
+    object $
+      [ "label" .= tailscaleEndpointLabel status,
+        "stateDirectory" .= tailscaleEndpointStateDirectory status,
+        "source" .= tailscaleEndpointSource status,
+        "available" .= tailscaleEndpointAvailable status,
+        "peers" .= tailscaleEndpointPeers status
+      ]
+        <> maybe [] (\value -> ["tag" .= value]) (tailscaleEndpointTag status)
+        <> maybe [] (\value -> ["tailnet" .= value]) (tailscaleEndpointTailnetName status)
+        <> maybe [] (\value -> ["magicDNSSuffix" .= value]) (tailscaleEndpointMagicDNSSuffix status)
+        <> maybe [] (\value -> ["snapshotTime" .= value]) (tailscaleEndpointSnapshotTime status)
+        <> maybe [] (\value -> ["reason" .= value]) (tailscaleEndpointReason status)
+        <> maybe [] (\value -> ["self" .= value]) (tailscaleEndpointSelf status)
+
+instance ToJSON TailscaleIPResult where
+  toJSON result =
+    object $
+      [ "endpoint" .= tailscaleIPResultEndpoint result,
+        "addresses" .= tailscaleIPResultAddresses result
+      ]
+        <> maybe [] (\value -> ["peer" .= value]) (tailscaleIPResultPeer result)
+        <> maybe [] (\value -> ["snapshotTime" .= value]) (tailscaleIPResultSnapshotTime result)
 
 instance ToJSON DelayHistory where
   toJSON delayHistory =

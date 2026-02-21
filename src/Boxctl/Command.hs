@@ -13,6 +13,9 @@ import Boxctl.Domain
     Proxy,
     ProxyShape (..),
     SsmUser (..),
+    TailscaleEndpointStatus (..),
+    TailscaleIPResult (..),
+    TailscalePeer (..),
     clashModeMatchesKnown,
     isSelectorProxy,
     isUrlTestProxy,
@@ -22,6 +25,7 @@ import Boxctl.Domain
   )
 import Boxctl.Error
 import Boxctl.Instance (resolveInstance, resolveSsmInstance)
+import qualified Boxctl.Instance as Instance
 import Boxctl.Output
   ( CommandDiagnostic (..),
     CommandDiagnosticVisibility (..),
@@ -30,16 +34,18 @@ import Boxctl.Output
     TestResult (..),
     emitCommandOutput,
   )
+import Boxctl.Tailscale (loadTailscaleEndpointStatus)
 import Boxctl.Terminal (resolveRenderStyle)
 import Control.Concurrent.Async (mapConcurrently)
 import Control.Exception (bracket_)
-import Control.Monad (unless)
+import Control.Monad (when, unless)
 import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE, withExceptT)
 import Data.Either (partitionEithers)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
@@ -77,6 +83,8 @@ executeCommand options =
   case optCommand options of
     CmdVersion ->
       runVersionCommand options
+    CmdTs tsOptions ->
+      runTailscaleCommand options tsOptions
     CmdSsm ssmOptions -> do
       controller <- resolveSsmController options ssmOptions
       runSsmCommand controller ssmOptions
@@ -173,6 +181,181 @@ runControllerCommand controller command =
       pure (successReport (CommandOutputSelect (proxyName selectorProxy) selectorOption))
     CmdSsm _ ->
       error "runControllerCommand: unexpected SSM command"
+    CmdTs _ ->
+      error "runControllerCommand: unexpected TS command"
+
+runTailscaleCommand :: Options -> TsOptions -> ExceptT BoxctlError IO CommandReport
+runTailscaleCommand options tsOptions = do
+  resolvedConfig <-
+    withExceptT
+      BoxctlInstanceError
+      (Instance.resolveTailscaleConfig (optInstanceTarget options) (optInstanceWorkdir options))
+  case tsSubcommand tsOptions of
+    TsStatus -> do
+      selectedEndpoints <- exceptCommand (selectTailscaleStatusEndpoints tsOptions resolvedConfig)
+      statuses <- withExceptT BoxctlInstanceError (loadTailscaleStatuses resolvedConfig selectedEndpoints)
+      pure (successReport (CommandOutputTailscaleStatus statuses))
+    TsIp ipOptions -> do
+      selectedEndpoint <- exceptCommand (selectTailscaleIpEndpoint tsOptions resolvedConfig)
+      status <- withExceptT BoxctlInstanceError (loadTailscaleStatus resolvedConfig selectedEndpoint)
+      validateTailscaleIpOptions ipOptions
+      unless (tailscaleEndpointAvailable status) $
+        exceptCommand $
+          Left
+            ( TailscaleSnapshotUnavailable
+                (tailscaleEndpointLabel status)
+                (fromMaybe "no cached tailscale status is available" (tailscaleEndpointReason status))
+            )
+      selectedPeer <- exceptCommand (resolveTailscalePeer status (tsIpPeer ipOptions))
+      addresses <- exceptCommand (selectTailscaleIPs ipOptions selectedPeer)
+      pure
+        ( successReport
+            ( CommandOutputTailscaleIP
+                TailscaleIPResult
+                  { tailscaleIPResultEndpoint = tailscaleEndpointLabel status,
+                    tailscaleIPResultPeer = Just (tailscalePeerName selectedPeer),
+                    tailscaleIPResultAddresses = addresses,
+                    tailscaleIPResultSnapshotTime = tailscaleEndpointSnapshotTime status
+                  }
+            )
+        )
+
+loadTailscaleStatuses ::
+  Instance.ResolvedTailscaleConfig ->
+  [Instance.TailscaleEndpointConfig] ->
+  ExceptT InstanceError IO [TailscaleEndpointStatus]
+loadTailscaleStatuses resolvedConfig =
+  mapM (loadTailscaleStatus resolvedConfig)
+
+loadTailscaleStatus ::
+  Instance.ResolvedTailscaleConfig ->
+  Instance.TailscaleEndpointConfig ->
+  ExceptT InstanceError IO TailscaleEndpointStatus
+loadTailscaleStatus resolvedConfig endpoint = do
+  stateDirectory <- Instance.resolveTailscaleStateDirectory resolvedConfig endpoint
+  liftIO (loadTailscaleEndpointStatus endpoint stateDirectory)
+
+selectTailscaleStatusEndpoints ::
+  TsOptions ->
+  Instance.ResolvedTailscaleConfig ->
+  Either CommandError [Instance.TailscaleEndpointConfig]
+selectTailscaleStatusEndpoints tsOptions resolvedConfig =
+  case tsTargetTag tsOptions of
+    Nothing ->
+      Right (Instance.resolvedTailscaleEndpoints resolvedConfig)
+    Just requestedTag ->
+      (: [])
+        <$> resolveTailscaleEndpointByLabel (Instance.resolvedTailscaleEndpoints resolvedConfig) requestedTag
+
+selectTailscaleIpEndpoint ::
+  TsOptions ->
+  Instance.ResolvedTailscaleConfig ->
+  Either CommandError Instance.TailscaleEndpointConfig
+selectTailscaleIpEndpoint tsOptions resolvedConfig =
+  case tsTargetTag tsOptions of
+    Just requestedTag ->
+      resolveTailscaleEndpointByLabel endpoints requestedTag
+    Nothing ->
+      case endpoints of
+        [endpoint] -> Right endpoint
+        many -> Left (MultipleTailscaleEndpoints (map Instance.tailscaleEndpointLabel many))
+  where
+    endpoints = Instance.resolvedTailscaleEndpoints resolvedConfig
+
+resolveTailscaleEndpointByLabel ::
+  [Instance.TailscaleEndpointConfig] ->
+  Text ->
+  Either CommandError Instance.TailscaleEndpointConfig
+resolveTailscaleEndpointByLabel endpoints requestedLabel =
+  case findByName Instance.tailscaleEndpointLabel endpoints requestedLabel of
+    MissingName ->
+      Left (TailscaleEndpointNotFound requestedLabel)
+    UniqueName endpoint ->
+      Right endpoint
+    AmbiguousName matches ->
+      Left (AmbiguousTailscaleEndpoint requestedLabel (map Instance.tailscaleEndpointLabel matches))
+
+validateTailscaleIpOptions :: TsIpOptions -> ExceptT BoxctlError IO ()
+validateTailscaleIpOptions ipOptions = do
+  let enabledFlagCount =
+        length
+          ( filter
+              id
+              [ tsIpWant1 ipOptions,
+                tsIpWant4 ipOptions,
+                tsIpWant6 ipOptions
+              ]
+          )
+  when (enabledFlagCount > 1) $
+    throwE (BoxctlCommandError InvalidTailscaleIpFlags)
+
+resolveTailscalePeer :: TailscaleEndpointStatus -> Maybe Text -> Either CommandError TailscalePeer
+resolveTailscalePeer status maybePeerName =
+  case maybePeerName of
+    Nothing ->
+      maybe
+        (Left (TailscaleSelfUnavailable (tailscaleEndpointLabel status)))
+        Right
+        (tailscaleEndpointSelf status)
+    Just requestedPeer ->
+      case findMatchingTailscalePeers requestedPeer status of
+        [] ->
+          Left (TailscalePeerNotFound requestedPeer)
+        [peer] ->
+          Right peer
+        peers ->
+          Left (AmbiguousTailscalePeer requestedPeer (map tailscalePeerName peers))
+
+findMatchingTailscalePeers :: Text -> TailscaleEndpointStatus -> [TailscalePeer]
+findMatchingTailscalePeers requestedPeer status =
+  filter matchesPeer (availablePeers status)
+  where
+    availablePeers endpointStatus =
+      maybe [] pure (tailscaleEndpointSelf endpointStatus)
+        <> tailscaleEndpointPeers endpointStatus
+
+    requestedFolded = T.toCaseFold (T.strip requestedPeer)
+
+    matchesPeer peer =
+      any ((== requestedFolded) . T.toCaseFold) (tailscalePeerAliases status peer)
+        || any ((== requestedFolded) . T.toCaseFold) (tailscalePeerIPs peer)
+
+tailscalePeerAliases :: TailscaleEndpointStatus -> TailscalePeer -> [Text]
+tailscalePeerAliases status peer =
+  dedupeTextValues $
+    [ tailscalePeerName peer ]
+      <> maybe [] pure (tailscalePeerHostName peer)
+      <> maybe [] pure (tailscalePeerDNSName peer)
+      <> maybe [] pure (tailscaleShortMagicDNSName status =<< tailscalePeerDNSName peer)
+
+tailscaleShortMagicDNSName :: TailscaleEndpointStatus -> Text -> Maybe Text
+tailscaleShortMagicDNSName status dnsName =
+  case tailscaleEndpointMagicDNSSuffix status of
+    Just suffix -> T.stripSuffix ("." <> suffix) dnsName
+    Nothing -> Nothing
+
+selectTailscaleIPs :: TsIpOptions -> TailscalePeer -> Either CommandError [Text]
+selectTailscaleIPs ipOptions peer = do
+  let addressFilter
+        | tsIpWant4 ipOptions = filter isIPv4Address
+        | tsIpWant6 ipOptions = filter isIPv6Address
+        | otherwise = id
+      filteredAddresses = addressFilter (tailscalePeerIPs peer)
+      selectedAddresses =
+        if tsIpWant1 ipOptions
+          then take 1 filteredAddresses
+          else filteredAddresses
+  if null selectedAddresses
+    then Left (NoTailscaleIPs (tailscalePeerName peer))
+    else Right selectedAddresses
+
+isIPv4Address :: Text -> Bool
+isIPv4Address address =
+  T.count ":" address == 0 && T.count "." address == 3
+
+isIPv6Address :: Text -> Bool
+isIPv6Address =
+  T.isInfixOf ":"
 
 runSsmCommand :: Controller -> SsmOptions -> ExceptT BoxctlError IO CommandReport
 runSsmCommand controller ssmOptions =

@@ -23,6 +23,9 @@ import Boxctl.Domain
     ProxyShape (..),
     SsmStats (..),
     SsmUser (..),
+    TailscaleEndpointStatus (..),
+    TailscaleIPResult (..),
+    TailscalePeer (..),
     VersionInfo (..),
     clashModeText,
     isGroupProxy,
@@ -132,6 +135,8 @@ data CommandOutput
   | CommandOutputSsmRemove [Text] [Text]
   | CommandOutputSsmUpdate Text
   | CommandOutputSsmStat Bool SsmStats
+  | CommandOutputTailscaleStatus [TailscaleEndpointStatus]
+  | CommandOutputTailscaleIP TailscaleIPResult
   deriving (Eq, Show)
 
 emitCommandOutput :: OutputMode -> RenderStyle -> [CommandDiagnostic] -> CommandOutput -> IO ()
@@ -183,6 +188,10 @@ renderCommandHuman renderStyle = \case
     Just ("updated password: " <> userName)
   CommandOutputSsmStat cleared stats ->
     Just (renderSsmStats cleared stats)
+  CommandOutputTailscaleStatus statuses ->
+    Just (renderTailscaleStatus statuses)
+  CommandOutputTailscaleIP result ->
+    Just (renderTailscaleIP result)
 
 renderCommandJson :: CommandOutput -> Value
 renderCommandJson = \case
@@ -241,6 +250,10 @@ renderCommandJson = \case
       [ "cleared" .= cleared,
         "stats" .= stats
       ]
+  CommandOutputTailscaleStatus statuses ->
+    object ["endpoints" .= statuses]
+  CommandOutputTailscaleIP result ->
+    toJSON result
 
 renderVersion :: Text -> Maybe VersionInfo -> Text
 renderVersion localVersion maybeVersionInfo =
@@ -357,6 +370,65 @@ renderSsmStats cleared stats =
           "tcp=" <> renderCount (ssmUserTcpSessions user),
           "udp=" <> renderCount (ssmUserUdpSessions user)
         ]
+
+renderTailscaleStatus :: [TailscaleEndpointStatus] -> Text
+renderTailscaleStatus statuses =
+  T.intercalate "\n\n" (map renderEndpoint (sortOn (T.toCaseFold . tailscaleEndpointLabel) statuses))
+  where
+    renderEndpoint status =
+      T.intercalate
+        "\n"
+        ( [ tailscaleEndpointLabel status,
+            "  source: " <> tailscaleEndpointSource status
+          ]
+            <> maybe [] (\value -> ["  tailnet: " <> value]) (tailscaleEndpointTailnetName status)
+            <> maybe [] (\value -> ["  magic-dns: " <> value]) (tailscaleEndpointMagicDNSSuffix status)
+            <> maybe [] (\value -> ["  snapshot: " <> formatTimestamp value]) (tailscaleEndpointSnapshotTime status)
+            <> renderAvailability status
+        )
+
+    renderAvailability status
+      | not (tailscaleEndpointAvailable status) =
+          ["  unavailable: " <> fromMaybe "unknown" (tailscaleEndpointReason status)]
+      | otherwise =
+          [ "  self: " <> maybe "unknown" renderTailscalePeerSummary (tailscaleEndpointSelf status),
+            "  peers:"
+          ]
+            <> renderPeerRows (tailscaleEndpointPeers status)
+
+    renderPeerRows peers =
+      case sortOn peerSortKey peers of
+        [] -> ["    none"]
+        orderedPeers -> map (("    " <>) . renderTailscalePeerSummary) orderedPeers
+
+    peerSortKey peer =
+      ( Down (tailscalePeerOnline peer == Just True),
+        T.toCaseFold (tailscalePeerName peer)
+      )
+
+renderTailscaleIP :: TailscaleIPResult -> Text
+renderTailscaleIP =
+  T.intercalate "\n" . tailscaleIPResultAddresses
+
+renderTailscalePeerSummary :: TailscalePeer -> Text
+renderTailscalePeerSummary peer =
+  T.intercalate "  " (baseParts <> statusParts)
+  where
+    baseParts =
+      [ tailscalePeerName peer,
+        case tailscalePeerIPs peer of
+          [] -> "-"
+          ips -> T.intercalate ", " ips
+      ]
+    statusParts =
+      maybe [] (\value -> ["os=" <> value]) (tailscalePeerOS peer)
+        <> [ "online"
+           | tailscalePeerOnline peer == Just True
+           ]
+        <> [ "offline"
+           | tailscalePeerOnline peer == Just False
+           ]
+        <> maybe [] (\value -> ["last-seen=" <> formatTimestamp value]) (tailscalePeerLastSeen peer)
 
 sanitizeSsmUsers :: Bool -> [SsmUser] -> [SsmUser]
 sanitizeSsmUsers showPassword

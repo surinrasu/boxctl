@@ -26,6 +26,7 @@ data InstanceError
   = InstancePathIsDirectory
   | InstanceConfigFileNotFound FilePath
   | InstanceConfigParseError Text
+  | InstanceConfigRequired
   | MissingClashApiConfig
   | MissingExternalController
   | MissingSsmApiServices
@@ -36,6 +37,8 @@ data InstanceError
   | MultipleSsmApiEndpoints Text [Text]
   | MissingSsmApiListen Text
   | MissingSsmApiListenPort Text
+  | MissingTailscaleEndpoints
+  | TailscaleWorkdirRequired Text FilePath
   | InvalidInstanceAddress Text
   deriving (Eq, Show)
 
@@ -72,6 +75,15 @@ data CommandError
   | DelayTestsFailed
   | SsmShowFailed
   | SsmRemoveFailed
+  | MultipleTailscaleEndpoints [Text]
+  | TailscaleEndpointNotFound Text
+  | AmbiguousTailscaleEndpoint Text [Text]
+  | InvalidTailscaleIpFlags
+  | TailscaleSnapshotUnavailable Text Text
+  | TailscalePeerNotFound Text
+  | AmbiguousTailscalePeer Text [Text]
+  | TailscaleSelfUnavailable Text
+  | NoTailscaleIPs Text
   deriving (Eq, Show)
 
 renderBoxctlError :: BoxctlError -> Text
@@ -88,6 +100,8 @@ renderInstanceError = \case
     "instance config file not found: " <> T.pack path
   InstanceConfigParseError err ->
     "failed to parse config file: " <> err
+  InstanceConfigRequired ->
+    "this command requires a sing-box config file target; use --instance-config or --instance PATH"
   MissingClashApiConfig ->
     "config file does not contain experimental.clash_api"
   MissingExternalController ->
@@ -112,6 +126,14 @@ renderInstanceError = \case
     "ssm-api service is missing listen address: " <> serviceLabel
   MissingSsmApiListenPort serviceLabel ->
     "ssm-api service is missing listen_port: " <> serviceLabel
+  MissingTailscaleEndpoints ->
+    "config file does not contain any tailscale endpoints"
+  TailscaleWorkdirRequired endpointLabel stateDirectory ->
+    "tailscale endpoint "
+      <> endpointLabel
+      <> " uses relative state_directory "
+      <> T.pack (show stateDirectory)
+      <> "; specify --instance-workdir to match sing-box working directory"
   InvalidInstanceAddress err ->
     err
 
@@ -190,6 +212,33 @@ renderCommandError = \case
     "one or more user detail requests failed"
   SsmRemoveFailed ->
     "one or more user removals failed"
+  MultipleTailscaleEndpoints labels ->
+    "multiple tailscale endpoints available, specify --tag: "
+      <> T.intercalate ", " labels
+  TailscaleEndpointNotFound endpointLabel ->
+    "tailscale endpoint not found: " <> endpointLabel
+  AmbiguousTailscaleEndpoint requested matches ->
+    "ambiguous tailscale endpoint: "
+      <> requested
+      <> " (matches: "
+      <> T.intercalate ", " matches
+      <> ")"
+  InvalidTailscaleIpFlags ->
+    "tailscale ip -1, -4, and -6 are mutually exclusive"
+  TailscaleSnapshotUnavailable endpointLabel reason ->
+    "tailscale endpoint " <> endpointLabel <> " is unavailable: " <> reason
+  TailscalePeerNotFound peerName ->
+    "tailscale peer not found: " <> peerName
+  AmbiguousTailscalePeer requested matches ->
+    "ambiguous tailscale peer: "
+      <> requested
+      <> " (matches: "
+      <> T.intercalate ", " matches
+      <> ")"
+  TailscaleSelfUnavailable endpointLabel ->
+    "tailscale endpoint " <> endpointLabel <> " does not have cached self node information"
+  NoTailscaleIPs targetLabel ->
+    "no tailscale IPs available for: " <> targetLabel
 
 apiDelayFailureLabel :: ApiError -> Maybe Text
 apiDelayFailureLabel = \case

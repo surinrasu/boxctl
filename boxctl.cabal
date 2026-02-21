@@ -52,6 +52,7 @@ library
   other-modules:
       Paths_boxctl
     , Boxctl.Terminal
+    , Boxctl.Tailscale
   exposed-modules:
       Boxctl.API
     , Boxctl.CLI

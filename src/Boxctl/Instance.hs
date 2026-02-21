@@ -5,12 +5,16 @@ module Boxctl.Instance
   ( ControllerAddress (..),
     InstanceTarget (..),
     ResolvedInstance (..),
+    ResolvedTailscaleConfig (..),
+    TailscaleEndpointConfig (..),
     guessInstanceTarget,
     instanceAddressTarget,
     instanceConfigTarget,
     normalizeControllerAddress,
     resolveInstance,
     resolveSsmInstance,
+    resolveTailscaleConfig,
+    resolveTailscaleStateDirectory,
     stripJsonComments,
   )
 where
@@ -30,9 +34,9 @@ import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
-import System.Directory (doesDirectoryExist, doesFileExist)
+import System.Directory (doesDirectoryExist, doesFileExist, makeAbsolute)
 import System.Environment (lookupEnv)
-import System.FilePath (hasDrive, isPathSeparator, takeExtension)
+import System.FilePath ((</>), hasDrive, isAbsolute, isPathSeparator, takeExtension)
 import Text.Read (readMaybe)
 
 newtype ControllerAddress = ControllerAddress
@@ -52,12 +56,27 @@ data ResolvedInstance = ResolvedInstance
   }
   deriving (Eq, Show)
 
+data ResolvedTailscaleConfig = ResolvedTailscaleConfig
+  { resolvedTailscaleConfigPath :: FilePath,
+    resolvedTailscaleWorkdir :: Maybe FilePath,
+    resolvedTailscaleEndpoints :: [TailscaleEndpointConfig]
+  }
+  deriving (Eq, Show)
+
+data TailscaleEndpointConfig = TailscaleEndpointConfig
+  { tailscaleEndpointLabel :: Text,
+    tailscaleEndpointTag :: Maybe Text,
+    tailscaleEndpointStateDirectoryRaw :: FilePath
+  }
+  deriving (Eq, Show)
+
 defaultControllerAddress :: Text
 defaultControllerAddress = "127.0.0.1:9090"
 
 data ConfigFile = ConfigFile
   { configExperimental :: Maybe ExperimentalBlock,
-    configServices :: [ServiceBlock]
+    configServices :: [ServiceBlock],
+    configEndpoints :: [EndpointBlock]
   }
 
 newtype ExperimentalBlock = ExperimentalBlock
@@ -82,6 +101,12 @@ newtype ServiceTLSBlock = ServiceTLSBlock
   { serviceTlsEnabled :: Maybe Bool
   }
 
+data EndpointBlock = EndpointBlock
+  { endpointType :: Text,
+    endpointTag :: Maybe Text,
+    endpointStateDirectory :: Maybe FilePath
+  }
+
 data NameMatch a
   = MissingName
   | UniqueName a
@@ -92,6 +117,7 @@ instance Aeson.FromJSON ConfigFile where
     ConfigFile
       <$> obj .:? "experimental"
       <*> (obj .:? "services" .!= [])
+      <*> (obj .:? "endpoints" .!= [])
 
 instance Aeson.FromJSON ExperimentalBlock where
   parseJSON = Aeson.withObject "ExperimentalBlock" $ \obj ->
@@ -116,6 +142,13 @@ instance Aeson.FromJSON ServiceBlock where
 instance Aeson.FromJSON ServiceTLSBlock where
   parseJSON = Aeson.withObject "ServiceTLSBlock" $ \obj ->
     ServiceTLSBlock <$> obj .:? "enabled"
+
+instance Aeson.FromJSON EndpointBlock where
+  parseJSON = Aeson.withObject "EndpointBlock" $ \obj ->
+    EndpointBlock
+      <$> obj .: "type"
+      <*> obj .:? "tag"
+      <*> obj .:? "state_directory"
 
 guessInstanceTarget :: String -> InstanceTarget
 guessInstanceTarget =
@@ -145,6 +178,44 @@ resolveSsmInstance cliInstance maybeServiceTag maybeEndpoint = do
       target
   pure resolved {resolvedSecret = envSecret <|> resolvedSecret resolved}
 
+resolveTailscaleConfig :: Maybe InstanceTarget -> Maybe FilePath -> ExceptT InstanceError IO ResolvedTailscaleConfig
+resolveTailscaleConfig cliInstance maybeWorkdir = do
+  configPath <- resolveConfigTargetSelection cliInstance
+  config <- readConfigFile configPath
+  let tailscaleEndpoints = collectTailscaleEndpoints (configEndpoints config)
+  if null tailscaleEndpoints
+    then ExceptT (pure (Left MissingTailscaleEndpoints))
+    else do
+      absoluteWorkdir <- traverse (liftIO . makeAbsolute) maybeWorkdir
+      pure
+        ResolvedTailscaleConfig
+          { resolvedTailscaleConfigPath = configPath,
+            resolvedTailscaleWorkdir = absoluteWorkdir,
+            resolvedTailscaleEndpoints = tailscaleEndpoints
+          }
+
+resolveTailscaleStateDirectory :: ResolvedTailscaleConfig -> TailscaleEndpointConfig -> ExceptT InstanceError IO FilePath
+resolveTailscaleStateDirectory resolved endpoint = do
+  expandedStateDirectory <-
+    liftIO (expandEnvironmentVariables (tailscaleEndpointStateDirectoryRaw endpoint))
+  let stateDirectory = expandedStateDirectory
+  if isAbsolute stateDirectory
+    then liftIO (makeAbsolute stateDirectory)
+    else
+      case resolvedTailscaleWorkdir resolved of
+        Just workdir ->
+          liftIO (makeAbsolute (workdir </> stateDirectory))
+        Nothing ->
+          ExceptT
+            ( pure
+                ( Left
+                    ( TailscaleWorkdirRequired
+                        (tailscaleEndpointLabel endpoint)
+                        stateDirectory
+                    )
+                )
+            )
+
 resolveTargetSelection :: Maybe InstanceTarget -> ExceptT InstanceError IO (InstanceTarget, Maybe Text)
 resolveTargetSelection cliInstance = do
   envInstance <- liftIO (fmap guessInstanceTarget <$> lookupEnv "BOXCTL_INSTANCE")
@@ -155,11 +226,17 @@ resolveTargetSelection cliInstance = do
           (cliInstance <|> envInstance)
   pure (target, envSecret)
 
+resolveConfigTargetSelection :: Maybe InstanceTarget -> ExceptT InstanceError IO FilePath
+resolveConfigTargetSelection cliInstance = do
+  envInstance <- liftIO (fmap guessInstanceTarget <$> lookupEnv "BOXCTL_INSTANCE")
+  let target = fromMaybe (InstanceTargetConfig "config.json") (cliInstance <|> envInstance)
+  resolveConfigFilePath target
+
 resolveTargetWith ::
-  (FilePath -> ExceptT InstanceError IO ResolvedInstance) ->
-  (ControllerAddress -> Either InstanceError ResolvedInstance) ->
+  (FilePath -> ExceptT InstanceError IO a) ->
+  (ControllerAddress -> Either InstanceError a) ->
   InstanceTarget ->
-  ExceptT InstanceError IO ResolvedInstance
+  ExceptT InstanceError IO a
 resolveTargetWith resolveConfig resolveAddress = \case
   InstanceTargetGuess rawTarget ->
     resolveGuessedTargetWith resolveConfig resolveAddress rawTarget
@@ -168,10 +245,30 @@ resolveTargetWith resolveConfig resolveAddress = \case
   InstanceTargetAddress controllerAddress ->
     exceptEither (resolveAddress controllerAddress)
 
+resolveConfigFilePath :: InstanceTarget -> ExceptT InstanceError IO FilePath
+resolveConfigFilePath = \case
+  InstanceTargetGuess rawTarget -> do
+    let target = T.unpack (T.strip rawTarget)
+    directoryExists <- liftIO (doesDirectoryExist target)
+    if directoryExists
+      then ExceptT (pure (Left InstancePathIsDirectory))
+      else do
+        fileExists <- liftIO (doesFileExist target)
+        if fileExists
+          then pure target
+          else
+            if looksLikeConfigPath target
+              then ExceptT (pure (Left (InstanceConfigFileNotFound target)))
+              else ExceptT (pure (Left InstanceConfigRequired))
+  InstanceTargetConfig configPath ->
+    resolveConfigTargetWith pure configPath
+  InstanceTargetAddress _ ->
+    ExceptT (pure (Left InstanceConfigRequired))
+
 resolveConfigTargetWith ::
-  (FilePath -> ExceptT InstanceError IO ResolvedInstance) ->
+  (FilePath -> ExceptT InstanceError IO a) ->
   FilePath ->
-  ExceptT InstanceError IO ResolvedInstance
+  ExceptT InstanceError IO a
 resolveConfigTargetWith resolveConfig configPath = do
   directoryExists <- liftIO (doesDirectoryExist configPath)
   if directoryExists
@@ -183,10 +280,10 @@ resolveConfigTargetWith resolveConfig configPath = do
         else ExceptT (pure (Left (InstanceConfigFileNotFound configPath)))
 
 resolveGuessedTargetWith ::
-  (FilePath -> ExceptT InstanceError IO ResolvedInstance) ->
-  (ControllerAddress -> Either InstanceError ResolvedInstance) ->
+  (FilePath -> ExceptT InstanceError IO a) ->
+  (ControllerAddress -> Either InstanceError a) ->
   Text ->
-  ExceptT InstanceError IO ResolvedInstance
+  ExceptT InstanceError IO a
 resolveGuessedTargetWith resolveConfig resolveAddress rawTarget = do
   let target = T.unpack (T.strip rawTarget)
   directoryExists <- liftIO (doesDirectoryExist target)
@@ -233,6 +330,18 @@ readConfigFile configPath = do
   let sanitized = stripJsonComments configBytes
   exceptEither $
     first (InstanceConfigParseError . T.pack) (Aeson.eitherDecodeStrict' sanitized)
+
+collectTailscaleEndpoints :: [EndpointBlock] -> [TailscaleEndpointConfig]
+collectTailscaleEndpoints endpoints =
+  [ TailscaleEndpointConfig
+      { tailscaleEndpointLabel = maybe fallbackLabel id (endpointTag endpoint),
+        tailscaleEndpointTag = endpointTag endpoint,
+        tailscaleEndpointStateDirectoryRaw = fromMaybe "tailscale" (endpointStateDirectory endpoint)
+      }
+  | (index, endpoint) <- zip [1 :: Int ..] endpoints,
+    T.toCaseFold (T.strip (endpointType endpoint)) == "tailscale",
+    let fallbackLabel = "#" <> T.pack (show index)
+  ]
 
 isSsmApiService :: ServiceBlock -> Bool
 isSsmApiService service =
@@ -433,6 +542,34 @@ findByMaybeName getName values requestedName =
       maybe False (== requested) . getName
     nameMatchesFold requested =
       maybe False ((== T.toCaseFold requested) . T.toCaseFold) . getName
+
+expandEnvironmentVariables :: FilePath -> IO FilePath
+expandEnvironmentVariables = go
+  where
+    go [] = pure []
+    go ('$' : '{' : rest) =
+      let (nameChars, suffix) = break (== '}') rest
+       in case suffix of
+            '}' : remaining
+              | validEnvName nameChars -> do
+                  value <- lookupEnv nameChars
+                  ((fromMaybe "") value <>) <$> go remaining
+            _ -> ('$' :) <$> go ('{' : rest)
+    go ('$' : rest@(nameStart : _))
+      | validEnvInitial nameStart =
+          let (nameChars, remaining) = span validEnvChar rest
+           in do
+                value <- lookupEnv nameChars
+                ((fromMaybe "") value <>) <$> go remaining
+    go (char : rest) =
+      (char :) <$> go rest
+
+    validEnvName [] = False
+    validEnvName (char : chars) = validEnvInitial char && all validEnvChar chars
+    validEnvInitial char =
+      char == '_' || ('A' <= char && char <= 'Z') || ('a' <= char && char <= 'z')
+    validEnvChar char =
+      validEnvInitial char || ('0' <= char && char <= '9')
 
 stripJsonComments :: BS.ByteString -> BS.ByteString
 stripJsonComments = BS.pack . goNormal . BS.unpack

@@ -14,6 +14,9 @@ module Boxctl.CLI
     SsmListOptions (..),
     SsmOptions (..),
     SsmStatOptions (..),
+    TsCommand (..),
+    TsIpOptions (..),
+    TsOptions (..),
     parseOptions,
   )
 where
@@ -26,6 +29,7 @@ import Options.Applicative
 
 data Options = Options
   { optInstanceTarget :: Maybe InstanceTarget,
+    optInstanceWorkdir :: Maybe FilePath,
     optVerbose :: Bool,
     optOutputMode :: OutputMode,
     optColorMode :: ColorMode,
@@ -53,6 +57,7 @@ data Command
   | CmdTest ProxySelection
   | CmdSelect SelectCommand
   | CmdSsm SsmOptions
+  | CmdTs TsOptions
   deriving (Eq, Show)
 
 data ListOptions = ListOptions
@@ -93,6 +98,25 @@ data SsmCommand
   | SsmStat SsmStatOptions
   deriving (Eq, Show)
 
+data TsOptions = TsOptions
+  { tsTargetTag :: Maybe Text,
+    tsSubcommand :: TsCommand
+  }
+  deriving (Eq, Show)
+
+data TsCommand
+  = TsStatus
+  | TsIp TsIpOptions
+  deriving (Eq, Show)
+
+data TsIpOptions = TsIpOptions
+  { tsIpWant1 :: Bool,
+    tsIpWant4 :: Bool,
+    tsIpWant6 :: Bool,
+    tsIpPeer :: Maybe Text
+  }
+  deriving (Eq, Show)
+
 newtype SsmListOptions = SsmListOptions
   { ssmListShowPassword :: Bool
   }
@@ -117,6 +141,13 @@ optionsParser :: Parser Options
 optionsParser =
   Options
     <$> optional instanceOption
+    <*> optional
+      ( strOption
+          ( long "instance-workdir"
+              <> metavar "PATH"
+              <> help "Working directory used by sing-box for resolving relative state paths"
+          )
+      )
     <*> switch
       ( long "verbose"
           <> short 'v'
@@ -180,6 +211,7 @@ commandParser =
       <> command "test" (info testParser (progDesc "Test delays of outbounds"))
       <> command "select" (info selectParser (progDesc "Select an option for a selector"))
       <> command "ssm" (info ssmParser (progDesc "Manage Shadowsocks users via SSM API"))
+      <> command "ts" (info tsParser (progDesc "Inspect sing-box embedded Tailscale state"))
 
 switchParser :: Parser Command
 switchParser =
@@ -259,6 +291,47 @@ ssmParser =
                   "SSM API endpoint path, e.g. / or /edge"
               )
             <*> ssmCommandParser
+        )
+
+tsParser :: Parser Command
+tsParser =
+  CmdTs
+    <$> ( TsOptions
+            <$> optional
+              ( textOption
+                  "tag"
+                  't'
+                  "NAME"
+                  "Tailscale endpoint tag from config endpoints[]"
+              )
+            <*> tsCommandParser
+        )
+
+tsCommandParser :: Parser TsCommand
+tsCommandParser =
+  hsubparser $
+    command "status" (info (pure TsStatus) (progDesc "Show cached Tailscale endpoint status"))
+      <> command "ip" (info tsIpParser (progDesc "Show cached Tailscale IP addresses"))
+
+tsIpParser :: Parser TsCommand
+tsIpParser =
+  TsIp
+    <$> ( TsIpOptions
+            <$> switch
+              ( short '1'
+                  <> help "Only print one IP address"
+              )
+            <*> switch
+              ( short '4'
+                  <> help "Only print IPv4 addresses"
+              )
+            <*> switch
+              ( short '6'
+                  <> help "Only print IPv6 addresses"
+              )
+            <*> optional
+              ( textArgument "PEER" "Peer hostname or IP address"
+              )
         )
 
 ssmCommandParser :: Parser SsmCommand

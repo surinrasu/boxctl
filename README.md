@@ -12,6 +12,7 @@ boxctl [OPTION] <COMMAND>
   - `--instance <<PATH>|<ADDR[:<PORT>]>>`   Target instance, guessed as config path or controller address
   - `--instance-config <PATH>`              Target instance config file
   - `--instance-address <ADDR[:<PORT>]>`    Target controller address
+  - `--instance-workdir <PATH>`             sing-box working directory
   - `--verbose`                             Verbose output
   - `--json`                                Emit JSON output
   - `--color <auto|always|never>`           Colorise human output, defaults to `auto`
@@ -27,6 +28,7 @@ boxctl [OPTION] <COMMAND>
   - `select <OPTION>`                       Select an option when only one selector exists
   - `select <SELECTOR> <OPTION>`            Select an option for a specific selector
   - `ssm ...`                               Manage Shadowsocks users via SSM API
+  - `ts ...`                                Inspect Tailscale state (from cache, not realtime)
 
 #### SSM
 
@@ -40,6 +42,15 @@ boxctl ssm [--tag NAME] [--endpoint PATH] <COMMAND>
   - `remove <USER1> [USER2] [...]`          Remove users
   - `update <USER>`                         Update a user's password
   - `stat`                                  Show traffic statistics
+
+#### Tailscale
+
+```shell
+boxctl ts [--tag NAME] <COMMAND>
+```
+
+  - `status`                                Show cached status for configured Tailscale endpoints
+  - `ip [PEER]`                             Show cached Tailscale IP addresses
 
 ### Env Variables
   - `BOXCTL_INSTANCE`                       Default target
