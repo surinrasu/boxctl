@@ -43,6 +43,7 @@ import Control.Monad.IO.Class (liftIO)
 import Control.Monad.Trans.Except (ExceptT, runExceptT, throwE, withExceptT)
 import Data.Either (partitionEithers)
 import Data.List (sortOn)
+import qualified Data.List as List
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (fromMaybe)
@@ -519,7 +520,7 @@ resolveUserByName users requestedName =
 
 dedupeTextValues :: [Text] -> [Text]
 dedupeTextValues =
-  foldl' insertIfMissing []
+  List.foldl' insertIfMissing []
   where
     insertIfMissing acc value
       | any (`textEqualsFold` value) acc = acc

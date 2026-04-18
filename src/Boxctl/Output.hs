@@ -45,6 +45,7 @@ import qualified Data.ByteString.Lazy.Char8 as BL8
 import Data.Foldable (traverse_)
 import Data.Int (Int64)
 import Data.List (sortOn)
+import qualified Data.List as List
 import Data.Map.Strict (Map)
 import qualified Data.Map.Strict as Map
 import Data.Maybe (catMaybes, fromMaybe, listToMaybe)
@@ -610,7 +611,7 @@ availableModeLines config =
     modes -> ["available=" <> T.intercalate ", " (map clashModeText modes)]
 
 dedupeModes :: [ClashMode] -> [ClashMode]
-dedupeModes = foldl' insertMode []
+dedupeModes = List.foldl' insertMode []
   where
     insertMode acc mode
       | mode `elem` acc = acc

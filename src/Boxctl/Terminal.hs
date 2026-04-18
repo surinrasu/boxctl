@@ -13,6 +13,7 @@ import Control.Monad (unless)
 import qualified Data.ByteString.Char8 as BS8
 import Data.Char (digitToInt, isHexDigit, toLower)
 import Data.List (stripPrefix)
+import qualified Data.List as List
 import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import qualified Data.Text as T
@@ -110,7 +111,7 @@ osc11InputAttributes :: TerminalAttributes -> TerminalAttributes
 osc11InputAttributes original =
   withTime
     ( withMinInput
-        (foldl' withoutMode original [ProcessInput, EnableEcho, KeyboardInterrupts, ExtendedFunctions])
+        (List.foldl' withoutMode original [ProcessInput, EnableEcho, KeyboardInterrupts, ExtendedFunctions])
         0
     )
     1
@@ -233,7 +234,7 @@ parseRgbChannel digits
   | null digits = Nothing
   | any (not . isHexDigit) digits = Nothing
   | otherwise =
-      let value = fromIntegral (foldl' step 0 digits) :: Double
+      let value = fromIntegral (List.foldl' step 0 digits) :: Double
           maxValue = fromIntegral (((16 :: Int) ^ length digits) - 1) :: Double
        in
         if maxValue <= 0

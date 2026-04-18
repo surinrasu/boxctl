@@ -8,7 +8,8 @@ _.path = ["{{config_root}}/.cabal/bin"]
 
 [plugins]
 ghc = "https://github.com/mise-plugins/mise-ghcup"
-hls = "https://github.com/mise-plugins/mise-ghcup"
+# Use a distinct source key so mise does not reuse ghc's git repo cache for hls, in case they need different version.
+hls = "https://github.com/mise-plugins/mise-ghcup.git"
 
 [tools]
 ghc = "latest"

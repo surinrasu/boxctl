@@ -68,6 +68,16 @@ cabal build
 cabal run boxctl # Use -- to pass params
 ```
 
+`nix develop` can also work without invoking `mise`, if you prefer to:
+
+```shell
+nix develop
+
+# In shell `nix develop` opened
+nix build
+nix run
+```
+
 ## License
 
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU Lesser General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
